@@ -86,6 +86,11 @@ def club_name(w: dict, cid: int) -> str:
 
 
 def club(w: dict, cid: int) -> dict:
+    if not cid:
+        return {
+            "id": 0, "name": "Free agent", "short": "FA", "nation": "",
+            "league_id": 0, "budget": 0, "reputation": 40, "colors": ["#889", "#223"],
+        }
     return next(c for c in w["clubs"] if c["id"] == cid)
 
 
@@ -424,7 +429,7 @@ def can_buy(w: dict, cid: int, p: dict) -> tuple[bool, str, int]:
         return False, "Already at the club.", 0
     if p.get("retired"):
         return False, "Retired.", 0
-    fee = int(p.get("value", 1_000_000) * 1.08)
+    fee = int(p.get("value", 1_000_000) * (0.28 if not p.get("club_id") else 1.08))
     if club(w, cid)["budget"] < fee:
         return False, "Not enough budget.", fee
     if len(squad(w, cid)) >= 28:
@@ -496,6 +501,8 @@ def complete_transfer(w: dict, pid: int, to_id: int, fee: int | None = None, yea
 
 def _seller_reply(w: dict, p: dict, buyer_id: int, fee: int, rounds: int = 1) -> tuple[str, str, int]:
     seller_id = p["club_id"]
+    if not seller_id:
+        return "yes", "Free agent agreed terms.", int(p.get("value", 0) * 0.28 or fee)
     sq = squad(w, seller_id)
     value = int(p.get("value", 0) or 1)
     tops = sorted(sq, key=lambda x: -float(x.get("overall", 70)))[:3]
@@ -772,46 +779,77 @@ def hire_scout(w: dict, region: str, who: str = "peter") -> str:
     return "ok"
 
 
+SCOUT_FAIL = (
+    "Thin market this week. No names worth the fee.",
+    "Doors stayed shut. Try another region next trip.",
+    "Watching lists came back empty. Change scout or region.",
+    "Targets were priced past your rank ceiling.",
+)
+
+
 def resolve_scout(w: dict) -> None:
     sc = w.get("user", {}).get("scout")
-    if not sc or sc.get("names") or sc.get("ready", "9999") > w["meta"]["current_date"]:
+    if not sc or sc.get("done") or sc.get("ready", "9999") > w["meta"]["current_date"]:
         return
     cid = w["user"]["club_id"]
+    spec = SCOUTS.get(sc.get("who"), SCOUTS["peter"])
     need = _weak_role(w, cid)
-    want = {"GK": ("GK",), "DEF": ("CB", "LB", "RB"), "MID": ("CM", "CDM", "CAM"), "ATT": ("ST", "LW", "RW")}[need]
+    lines = {
+        "GK": ("GK",),
+        "DEF": ("CB", "LB", "RB"),
+        "MID": ("CM", "CDM", "CAM", "LM", "RM"),
+        "ATT": ("ST", "LW", "RW"),
+    }
+    want = lines[need]
     cap = max_buy_ovr(w, cid)
-    avg = squad_ovr(w, cid)
     nats = SCOUT_REGIONS.get(sc["region"], set())
     found = []
-    for p in w["players"]:
+
+    def consider(p, rank_ok: bool) -> None:
         if p.get("retired") or p.get("club_id") == cid:
-            continue
+            return
         pos = (p.get("roles") or [{"code": "CM"}])[0]["code"]
-        if pos not in want:
-            continue
-        club_nat = club(w, p["club_id"]).get("nation", "")
-        if p.get("nation") not in nats and club_nat not in nats:
-            continue
         ovr = float(p["overall"])
-        spec = SCOUTS.get(sc.get("who"), SCOUTS["peter"])
-        seller_rank = team_rank(w, p["club_id"])
-        if seller_rank not in spec["ranks"]:
-            continue
-        if spec.get("growth") and float(p.get("potential", ovr)) < ovr + 5:
-            continue
-        if ovr > cap + 0.2 or ovr < avg - 8:
-            continue
-        ok, _, fee = can_buy(w, cid, p)
-        if not ok:
-            continue
-        score = ovr + float(p.get("potential", ovr)) * (0.35 if spec.get("growth") else 0.12) - fee / 8_000_000
-        found.append((score, p, fee))
+        pot = float(p.get("potential", ovr))
+        is_fa = not p.get("club_id")
+        club_nat = "" if is_fa else club(w, p["club_id"]).get("nation", "")
+        if p.get("nation") not in nats and club_nat not in nats and not is_fa:
+            return
+        if not rank_ok and not is_fa:
+            if team_rank(w, p["club_id"]) not in spec["ranks"]:
+                return
+        if spec.get("growth") and pot < ovr + 4 and not is_fa:
+            return
+        if ovr > cap + 1.5:
+            return
+        score = ovr + pot * (0.4 if spec.get("growth") else 0.15)
+        if pos in want:
+            score += 6
+        if is_fa:
+            score += 8
+        found.append((score, p))
+
+    for p in w["players"]:
+        consider(p, True)
+    if len(found) < 4:
+        for p in w["players"]:
+            consider(p, False)
     found.sort(key=lambda x: -x[0])
-    sc["names"] = [p["id"] for _, p, _ in found[:8]]
-    if sc["names"]:
-        add_news(w, f"Scout report: {len(sc['names'])} {need} options in {sc['region']}.", "desk", True)
+    seen = set()
+    names = []
+    for _, p in found:
+        if p["id"] in seen:
+            continue
+        seen.add(p["id"])
+        names.append(p["id"])
+        if len(names) >= 8:
+            break
+    sc["names"] = names
+    sc["done"] = True
+    if names:
+        add_news(w, f"{spec['name']}: {len(names)} names in {sc['region']} (need {need}).", "desk", True)
     else:
-        add_news(w, f"Scout found nobody you can actually sign in {sc['region']}.", "desk", True)
+        add_news(w, f"{spec['name']}: {random.choice(SCOUT_FAIL)}", "desk", True)
 
 
 def ai_window_tick(w: dict) -> None:
@@ -1493,7 +1531,7 @@ def _regen_player(w: dict, old: dict) -> dict:
         "last_name": random.choice(lasts or ["Ndlovu", "Costa", "Berg"]),
         "birthdate": f"{y - 18}-{random.randint(1,12):02d}-{random.randint(1,28):02d}",
         "nation": old.get("nation", "England"),
-        "club_id": old.get("club_id"),
+        "club_id": 0,
         "overall": ovr,
         "potential": pot,
         "roles": list(old.get("roles") or [{"code": "CM", "fit": 1}]),
@@ -1509,6 +1547,15 @@ def _regen_player(w: dict, old: dict) -> dict:
         "season_stats": {"apps": 0, "goals": 0, "assists": 0},
         "contract_years": 3,
     }
+    old_club = old.get("club_id")
+    if random.random() < 0.55:
+        kid["club_id"] = 0
+    else:
+        pool = [
+            c["id"] for c in w["clubs"]
+            if c["id"] != old_club and len(squad(w, c["id"])) < 26
+        ]
+        kid["club_id"] = random.choice(pool) if pool else 0
     w["players"].append(kid)
     return kid
 
@@ -1574,7 +1621,8 @@ def season_turnover(w: dict) -> None:
                 True,
                 club_id=None,
             )
-            add_news(w, f"{club_nm} register {kid['first_name']} {kid['last_name']} (18, {kid['overall']:.0f}).", "desk", p.get("club_id") == uid)
+            dest = "as a free agent" if not kid.get("club_id") else f"at {club_name(w, kid['club_id'])}"
+            add_news(w, f"{kid['first_name']} {kid['last_name']} (18, {kid['overall']:.0f}) is on the market {dest}.", "desk", True)
 
 
 def leaders(w: dict, lid: int, stat: str, n: int = 8) -> list:
