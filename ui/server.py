@@ -986,6 +986,7 @@ def page_market(cr: dict, raw_q: str = "") -> str:
             f"<form method='post' action='/buy/{p['id']}' class='inline'>"
             f"<select name='years'><option value='2'>2y</option><option value='3' selected>3y</option>"
             f"<option value='4'>4y</option><option value='5'>5y</option></select> "
+            f"<input name='fee' placeholder='£ bid' size='8'> "
             f"<button>Bid £{fee:,}</button></form>"
             if ok else f"<span class='muted'>{why}</span>"
         )
@@ -1011,6 +1012,18 @@ def page_market(cr: dict, raw_q: str = "") -> str:
                 f"<input name='ask' placeholder='Ask £'>"
                 f"<button>Ask more</button></form>"
                 f"<form method='post' action='/offer/{off['id']}/accept'><button>Discount / accept</button></form>"
+                f"</div></li>"
+            )
+        elif off["status"] == "counter" and off["buyer_id"] == my:
+            want = int(off.get("want") or off["fee"])
+            outgoing.append(
+                f"<li>{line} — {off.get('reply','')}"
+                f"<div class='row tight'>"
+                f"<form method='post' action='/offer/{off['id']}/meet'><button>Meet £{want:,}</button></form>"
+                f"<form method='post' action='/offer/{off['id']}/counter'>"
+                f"<input name='ask' placeholder='Your bid'>"
+                f"<button>Send new bid</button></form>"
+                f"<form method='post' action='/offer/{off['id']}/reject'><button>Walk away</button></form>"
                 f"</div></li>"
             )
         else:
@@ -1678,7 +1691,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/buy/"):
             yrs = int(form.get("years") or 3)
-            W.try_buy(cr, int(path.rsplit("/", 1)[-1]), yrs)
+            raw = "".join(ch for ch in (form.get("fee") or "") if ch.isdigit())
+            W.try_buy(cr, int(path.rsplit("/", 1)[-1]), yrs, int(raw) if raw else None)
             self._redir("/market")
             return
         if path.startswith("/sell/"):

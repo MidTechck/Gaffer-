@@ -16,7 +16,7 @@ from engine import press
 def badge(club: dict, size: int = 28) -> str:
     return badge_svg(club or {}, size)
 from engine import sponsors as SPON
-from engine.ratings import age_from_birth, compute_value, compute_wage, condition_tick, growth_delta, staff_wage
+from engine.ratings import age_from_birth, compute_value, compute_wage, condition_tick, grow_skills, growth_delta, staff_wage
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -494,23 +494,24 @@ def complete_transfer(w: dict, pid: int, to_id: int, fee: int | None = None, yea
     return line
 
 
-def _seller_reply(w: dict, p: dict, buyer_id: int, fee: int, rounds: int = 1) -> tuple[str, str]:
+def _seller_reply(w: dict, p: dict, buyer_id: int, fee: int, rounds: int = 1) -> tuple[str, str, int]:
     seller_id = p["club_id"]
     sq = squad(w, seller_id)
-    if len(sq) <= 18:
-        return "short", "Squad too thin. Talks closed."
-    want = int(p.get("value", 0) * (1.18 if rounds == 1 else 1.08))
+    value = int(p.get("value", 0) or 1)
     tops = sorted(sq, key=lambda x: -float(x.get("overall", 70)))[:3]
     star = p["id"] in {x["id"] for x in tops}
+    want = int(value * (1.48 if star else 1.32 if rounds == 1 else 1.18))
+    if len(sq) <= 18:
+        return "short", "Squad too thin. Talks closed.", want
     if club(w, buyer_id).get("budget", 0) < 0:
-        return "no", "Sort your books first."
-    if star and fee < int(p.get("value", 0) * 1.35):
-        return "talk", f"He is not leaving cheap. Come back nearer £{int(p['value']*1.35):,}."
-    if fee < want:
-        return "talk", f"Not agreed. We want about £{want:,}."
-    if rounds < 2 and float(p.get("overall", 70)) >= 80:
-        return "talk", "Directors need another meeting."
-    return "yes", "Both boards signed. Papers going through."
+        return "no", "Sort your books first.", want
+    if rounds >= 4 and fee < want:
+        return "no", "Talks collapsed.", want
+    if fee + 50_000 < want:
+        return "talk", f"Not enough. We want £{want:,}.", want
+    if rounds < 2 and float(p.get("overall", 70)) >= 82:
+        return "talk", f"Directors want another look. Floor is £{want:,}.", want
+    return "yes", "Both boards signed. Papers going through.", want
 
 
 def open_offer(w: dict, pid: int, buyer_id: int, years: int = 3, fee: int | None = None) -> dict:
@@ -572,13 +573,23 @@ def resolve_offers(w: dict) -> None:
             off["reply"] = f"{club_name(w, off['buyer_id'])} bid £{off['fee']:,}. Accept, reject, or ask more."
             add_news(w, off["reply"] + f" ({p['last_name']})", "desk", True)
             continue
-        status, reply = _seller_reply(w, p, off["buyer_id"], off["fee"], int(off.get("rounds", 1)))
+        status, reply, want = _seller_reply(w, p, off["buyer_id"], off["fee"], int(off.get("rounds", 1)))
         off["reply"] = reply
+        off["want"] = want
         if status == "talk":
             off["rounds"] = int(off.get("rounds", 1)) + 1
-            off["resolve"] = fmt_d(parse_d(today) + timedelta(days=1))
             if off["buyer_id"] == uid:
-                add_news(w, f"{p['last_name']}: {reply}", "desk", True)
+                off["status"] = "counter"
+                add_news(w, f"{p['last_name']}: {reply} Meet it or type a new bid.", "desk", True)
+                continue
+            buyer = club(w, off["buyer_id"])
+            if buyer.get("budget", 0) >= want and want <= int(p.get("value", 0) * 1.7):
+                off["fee"] = want
+                off["status"] = "processing"
+                off["resolve"] = fmt_d(parse_d(today) + timedelta(days=1))
+            else:
+                off["status"] = "rejected"
+                off["reply"] = "They would not meet the asking price."
             continue
         if status != "yes":
             off["status"] = "rejected"
@@ -604,7 +615,7 @@ def resolve_offers(w: dict) -> None:
 
 def user_offer_action(w: dict, oid: int, action: str) -> str:
     off = next((o for o in w.get("offers", []) if o["id"] == oid), None)
-    if not off or off["status"] != "awaiting":
+    if not off or off["status"] not in ("awaiting", "counter"):
         return "no offer"
     p = player(w, off["pid"])
     if action == "accept":
@@ -617,32 +628,47 @@ def user_offer_action(w: dict, oid: int, action: str) -> str:
         off["reply"] = "You rejected the bid."
         add_news(w, f"You rejected {club_name(w, off['buyer_id'])} for {p['last_name']}.", "desk", True)
         return "rejected"
-    if action == "raise":
+    if action == "meet":
+        want = int(off.get("want") or off.get("ask") or off["fee"])
+        off["fee"] = want
+        off["status"] = "processing"
+        off["resolve"] = fmt_d(parse_d(w["meta"]["current_date"]) + timedelta(days=1))
+        off["reply"] = f"You matched £{want:,}. Papers moving."
+        add_news(w, f"{p['last_name']}: matched their ask £{want:,}.", "desk", True)
+        return "met"
+    if action in ("raise", "counter"):
         extra = off.get("ask")
-        off["fee"] = int(extra) if extra else int(off["fee"] * 1.18)
+        fee = int(extra) if extra else int(off.get("want") or off["fee"] * 1.18)
+        off["fee"] = fee
+        if off["status"] == "counter":
+            off["status"] = "processing"
+            off["resolve"] = fmt_d(parse_d(w["meta"]["current_date"]) + timedelta(days=1))
+            off["reply"] = f"New bid £{fee:,} sent."
+            add_news(w, f"{p['last_name']}: you bid £{fee:,}.", "desk", True)
+            return "countered"
         buyer = club(w, off["buyer_id"])
-        if buyer["budget"] >= off["fee"] and float(p["overall"]) <= max_buy_ovr(w, buyer["id"]) + 1:
+        if buyer["budget"] >= fee and float(p["overall"]) <= max_buy_ovr(w, buyer["id"]) + 1:
             off["status"] = "signed"
-            off["reply"] = f"{buyer['name']} met £{off['fee']:,}."
-            complete_transfer(w, off["pid"], off["buyer_id"], off["fee"], off.get("years", 3))
+            off["reply"] = f"{buyer['name']} met £{fee:,}."
+            complete_transfer(w, off["pid"], off["buyer_id"], fee, off.get("years", 3))
             return "raised-ok"
         off["status"] = "rejected"
-        off["reply"] = f"{buyer['name']} walked away from £{off['fee']:,}."
+        off["reply"] = f"{buyer['name']} walked away from £{fee:,}."
         add_news(w, off["reply"], "desk", True)
         return "raised-no"
     return "no"
 
 
-def try_buy(w: dict, pid: int, years: int = 3) -> str:
+def try_buy(w: dict, pid: int, years: int = 3, fee: int | None = None) -> str:
     uid = w["user"]["club_id"]
     p = player(w, pid)
-    ok, why, fee = can_buy(w, uid, p)
+    ok, why, auto = can_buy(w, uid, p)
     if not ok:
         add_news(w, f"Bid for {p['last_name']} failed. {why}", "desk", True)
         return why
-    if any(o["status"] == "processing" and o["pid"] == pid and o["buyer_id"] == uid for o in w.get("offers", [])):
+    if any(o["status"] in ("processing", "counter") and o["pid"] == pid and o["buyer_id"] == uid for o in w.get("offers", [])):
         return "Already processing."
-    open_offer(w, pid, uid, years, fee)
+    open_offer(w, pid, uid, years, int(fee) if fee else auto)
     return "processing"
 
 
@@ -1095,6 +1121,12 @@ def apply_match_consequences(w: dict, fx: dict, home: dict, away: dict, res: dic
             hist = p.setdefault("form_hist", [])
             hist.append(rat)
             p["form"] = round(sum(hist[-5:]) / len(hist[-5:]), 2)
+            try:
+                ag = age_from_birth(p["birthdate"], w["meta"]["current_date"])
+                if ag >= 34:
+                    p["form"] = round(max(5.0, float(p["form"]) - 0.12), 2)
+            except Exception:
+                pass
             p["condition"] = condition_tick(float(p.get("condition", 90)), True, False)
             mood = float(p.get("morale", 72))
             if rat >= 7.2:
@@ -1119,6 +1151,8 @@ def apply_match_consequences(w: dict, fx: dict, home: dict, away: dict, res: dic
         mine = w.get("user", {}).get("club_id")
         if p.get("club_id") == mine:
             add_news(w, line, "injury", True)
+        if inj.get("big") or inj["days"] >= 90 or "break" in kind.lower() or "bone" in kind.lower() or "acl" in kind.lower():
+            p["career_risk"] = True
         if inj.get("big") or inj["days"] >= 60:
             add_news(
                 w,
@@ -1446,38 +1480,101 @@ def continue_cups(w: dict) -> None:
             w.setdefault("cup_byes", {}).setdefault(title, []).append(winners[i])
 
 
+def _regen_player(w: dict, old: dict) -> dict:
+    pid = 1 + max((x["id"] for x in w["players"] if isinstance(x.get("id"), int)), default=0)
+    y = int(w["meta"].get("season_start_year", 2026))
+    firsts = [x.get("first_name", "Alex") for x in w["players"] if x.get("nation") == old.get("nation")]
+    lasts = [x.get("last_name", "Young") for x in w["players"] if x.get("nation") == old.get("nation")]
+    ovr = round(random.uniform(58, 67), 1)
+    pot = round(min(88, ovr + random.uniform(8, 18)), 1)
+    kid = {
+        "id": pid,
+        "first_name": random.choice(firsts or ["Alex", "Jamie", "Sam"]),
+        "last_name": random.choice(lasts or ["Ndlovu", "Costa", "Berg"]),
+        "birthdate": f"{y - 18}-{random.randint(1,12):02d}-{random.randint(1,28):02d}",
+        "nation": old.get("nation", "England"),
+        "club_id": old.get("club_id"),
+        "overall": ovr,
+        "potential": pot,
+        "roles": list(old.get("roles") or [{"code": "CM", "fit": 1}]),
+        "skills": grow_skills({k: random.uniform(48, 64) for k in ("pace", "passing", "shooting", "dribbling", "defence", "physical", "gk")}, 0, old.get("roles")),
+        "value": compute_value(ovr, 18),
+        "adaptation": 40,
+        "condition": 90,
+        "form": 6.4,
+        "foot": old.get("foot", "R"),
+        "height_cm": old.get("height_cm", 180),
+        "injury": None,
+        "retired": False,
+        "season_stats": {"apps": 0, "goals": 0, "assists": 0},
+        "contract_years": 3,
+    }
+    w["players"].append(kid)
+    return kid
+
+
+def _should_retire(p: dict, age: int, apps: int) -> bool:
+    if age >= 41:
+        return True
+    if p.get("career_risk") and age >= 34 and random.random() < 0.42:
+        return True
+    if age < 36:
+        return False
+    chance = 0.18 + (age - 36) * 0.14
+    if apps < 8:
+        chance += 0.22
+    if float(p.get("form", 6.6)) < 6.2:
+        chance += 0.12
+    if float(p.get("overall", 70)) < 72:
+        chance += 0.18
+    if p.get("injury"):
+        chance += 0.1
+    return random.random() < min(0.92, chance)
+
+
 def season_turnover(w: dict) -> None:
     today = w["meta"]["current_date"]
     retired = []
+    uid = w.get("user", {}).get("club_id")
     for p in w["players"]:
         if p.get("retired"):
             continue
         age = age_from_birth(p["birthdate"], today)
-        mins = int(p.get("season_stats", {}).get("apps", 0)) * 80
-        p["overall"] = round(
-            max(40.0, min(99.9, p["overall"] + growth_delta(age, p["overall"], p.get("potential", p["overall"] + 2), mins))),
-            1,
+        st = p.get("season_stats") or {}
+        apps = int(st.get("apps", 0))
+        delta = growth_delta(
+            age,
+            float(p["overall"]),
+            float(p.get("potential", p["overall"] + 2)),
+            apps,
+            int(st.get("goals", 0)),
+            int(st.get("assists", 0)),
         )
+        p["overall"] = round(max(40.0, min(99.9, float(p["overall"]) + delta)), 1)
+        p["skills"] = grow_skills(p.get("skills"), delta, p.get("roles"))
         p["value"] = compute_value(p["overall"], age)
         p["season_stats"] = {"apps": 0, "goals": 0, "assists": 0}
         p["condition"] = 88
-        p["form"] = 6.6
-        if age >= 36 and p["overall"] < 74:
+        if age >= 34:
+            p["form"] = round(max(5.2, 6.6 - (age - 33) * 0.25), 2)
+        else:
+            p["form"] = 6.6
+        if _should_retire(p, age, apps):
             p["retired"] = True
             retired.append(p)
-        elif age >= 38:
-            p["retired"] = True
-            retired.append(p)
-    for p in retired[:8]:
-        if p.get("club_id") == w.get("user", {}).get("club_id"):
-            add_news(w, f"{p['last_name']} retired.", "board", True)
+    for p in retired:
+        kid = _regen_player(w, p)
+        club_nm = club_name(w, p.get("club_id") or uid or 0)
+        if p.get("club_id") == uid or float(p.get("overall", 0)) >= 75:
+            add_news(w, f"{p['first_name']} {p['last_name']} retired at {club_nm}.", "board", True)
             add_news(
                 w,
-                press.fill("retire", player=f"{p['first_name']} {p['last_name']}", club=club_name(w, p.get("club_id", 0) or w["user"]["club_id"])),
+                press.fill("retire", player=f"{p['first_name']} {p['last_name']}", club=club_nm),
                 "wire",
                 True,
                 club_id=None,
             )
+            add_news(w, f"{club_nm} register {kid['first_name']} {kid['last_name']} (18, {kid['overall']:.0f}).", "desk", p.get("club_id") == uid)
 
 
 def leaders(w: dict, lid: int, stat: str, n: int = 8) -> list:
