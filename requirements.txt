@@ -1,0 +1,1 @@
+# stdlib only — Railway / Termux need Python 3.10+
