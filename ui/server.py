@@ -906,8 +906,12 @@ def page_schedule(cr: dict, raw_q: str = "") -> str:
             if fx:
                 ha = "Home" if fx["home_id"] == cid else "Away"
                 opp = fx["away_id"] if ha == "Home" else fx["home_id"]
-                tag = {"UCL": "UCL", "Europa League": "EUROPA", "Conference League": "UECL",
+                tag = {"UCL": "UCL", "Europa League": "UEL", "Conference League": "UECL",
                        "CAF Champions League": "CAF"}.get(fx.get("cup"), "CUP" if fx.get("cup") else "LEAGUE")
+                if fx.get("ko_round") == "playoff":
+                    tag = "PO"
+                elif fx.get("ko_round") == "final":
+                    tag = tag + " F"
                 cls += " match " + ("home" if ha == "Home" else "away")
                 if fx.get("played"):
                     gf = fx["home_goals"] if ha == "Home" else fx["away_goals"]
@@ -1297,11 +1301,26 @@ def page_ucl(cr: dict) -> str:
             + f"</li>"
             for f in sorted(fx, key=lambda x: (x.get("date", ""), x.get("round", 0)))[:24]
         )
+        order_l = []
+        for rnd in ("playoff", "r16_po", "r16", "qf", "sf", "final"):
+            rows = []
+            for f in sorted((x for x in fx if x.get("ko_round") == rnd), key=lambda x: (x.get("tie", ""), x.get("leg", 1))):
+                sc = f"{f.get('home_goals',0)}–{f.get('away_goals',0)}" if f.get("played") else f["date"][5:]
+                rows.append(
+                    f"<li>{W.badge(W.club(cr, f['home_id']), 16)} {W.club(cr, f['home_id'])['short']} "
+                    f"v {W.badge(W.club(cr, f['away_id']), 16)} {W.club(cr, f['away_id'])['short']}"
+                    f" · L{f.get('leg',1)} · {sc}</li>"
+                )
+            if rows:
+                lab = {"playoff": "Aug playoff", "r16_po": "KO playoff", "r16": "Round of 16",
+                       "qf": "Quarter-finals", "sf": "Semi-finals", "final": "Final"}[rnd]
+                order_l.append(f"<h4>{lab}</h4><ul class='feed tight'>{''.join(rows)}</ul>")
+        bracket = "".join(order_l) or "<p class='muted'>Knockout after the league phase.</p>"
         return (
             f"<h2>{title}</h2>"
             f"<div class='split-eu'>"
-            f"<div class='panel scroll'><h3>Draw</h3><ul class='feed tight'>{qual}</ul></div>"
-            f"<div class='panel scroll'><h3>Table</h3>"
+            f"<div class='panel scroll'><h3>Draw / KO</h3>{bracket}<h3>Fixtures</h3><ul class='feed tight'>{qual}</ul></div>"
+            f"<div class='panel scroll'><h3>League phase</h3>"
             f"<table class='grid slim'><thead><tr><th>#</th><th>Club</th><th>P</th><th>Pts</th><th>GD</th></tr></thead>"
             f"<tbody>{table or '<tr><td colspan=5>Field empty.</td></tr>'}</tbody></table></div>"
             f"</div>"
@@ -1309,7 +1328,7 @@ def page_ucl(cr: dict) -> str:
     note = (
         "<p class='lede'>Season 1 is domestic only. Finish the league — top 5 UCL, 6th Europa, 7th–8th Conference next year. One ticket each.</p>"
         if not cr["meta"].get("europe_on")
-        else "<p class='lede'>Tickets from last season’s table. A club plays only one of UCL / Europa / Conference.</p>"
+        else "<p class='lede'>League phase, then knockout. Out of Europe means out. Cup winners can take a Europa seat next season if they are not already in UCL.</p>"
     )
     return html_page("UCL", f"""
     <h1>Europe & Africa</h1>

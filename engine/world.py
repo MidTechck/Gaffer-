@@ -208,6 +208,10 @@ def ensure_cups(w: dict) -> None:
     if not any(f.get("cup") and f.get("cup") not in CONTINENTAL for f in w.get("fixtures", [])):
         w["fixtures"].extend(_first_cup_rounds(w, w.get("fixtures", []), y))
     seed_continental(w, y)
+    try:
+        advance_europe(w)
+    except Exception:
+        pass
 
 
 def europe_tickets_from_tables(w: dict) -> dict:
@@ -247,6 +251,20 @@ def europe_tickets_from_tables(w: dict) -> dict:
             if cid not in used:
                 tickets["CAF Champions League"].append(cid)
                 used.add(cid)
+    for lid_s, cid in (w.get("meta", {}).get("cup_winners") or {}).items():
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            continue
+        if cid in used:
+            continue
+        try:
+            nat_lid = club(w, cid)["league_id"]
+        except StopIteration:
+            continue
+        if nat_lid in EURO_LIDS:
+            tickets["Europa League"].append(cid)
+            used.add(cid)
     return tickets
 
 
@@ -281,6 +299,117 @@ def _league_phase(w, title, ids, year, dates, fid, rng):
     return fid
 
 
+def _fid(w: dict) -> int:
+    return 1 + max((f["id"] for f in w["fixtures"] if isinstance(f.get("id"), int)), default=0)
+
+
+def _add_tie(w, title, a, b, ko_round, d1, d2, two_leg=True):
+    fid = _fid(w)
+    tie = f"{title}:{ko_round}:{a}-{b}"
+    w["fixtures"].append({
+        "id": fid, "league_id": 0, "cup": title, "phase": "knockout",
+        "ko_round": ko_round, "leg": 1, "tie": tie, "round": {"playoff": 10, "r16": 16, "qf": 8, "sf": 4, "final": 2}.get(ko_round, 16),
+        "week": 0, "date": d1, "home_id": a, "away_id": b, "played": False,
+    })
+    if two_leg:
+        w["fixtures"].append({
+            "id": fid + 1, "league_id": 0, "cup": title, "phase": "knockout",
+            "ko_round": ko_round, "leg": 2, "tie": tie, "round": {"playoff": 10, "r16": 16, "qf": 8, "sf": 4, "final": 2}.get(ko_round, 16),
+            "week": 0, "date": d2, "home_id": b, "away_id": a, "played": False,
+        })
+
+
+def _tie_winner(legs: list) -> int | None:
+    if any(not f.get("played") for f in legs):
+        return None
+    g = {}
+    for f in legs:
+        g[f["home_id"]] = g.get(f["home_id"], 0) + int(f.get("home_goals", 0))
+        g[f["away_id"]] = g.get(f["away_id"], 0) + int(f.get("away_goals", 0))
+    ids = list(g)
+    if len(ids) < 2:
+        return ids[0] if ids else None
+    a, b = ids[0], ids[1]
+    if g[a] != g[b]:
+        return a if g[a] > g[b] else b
+    last = max(legs, key=lambda x: x.get("date", ""))
+    ha, aa = int(last.get("home_goals", 0)), int(last.get("away_goals", 0))
+    if ha != aa:
+        return last["home_id"] if ha > aa else last["away_id"]
+    return last["home_id"] if random.random() < 0.5 else last["away_id"]
+
+
+def europe_table(w: dict, title: str) -> list:
+    pts: dict[int, list] = {}
+    for f in w["fixtures"]:
+        if f.get("cup") != title or f.get("phase") not in ("league", "group"):
+            continue
+        pts.setdefault(f["home_id"], [0, 0, 0, 0])
+        pts.setdefault(f["away_id"], [0, 0, 0, 0])
+        if not f.get("played"):
+            continue
+        hg, ag = int(f.get("home_goals", 0)), int(f.get("away_goals", 0))
+        pts[f["home_id"]][3] += 1
+        pts[f["away_id"]][3] += 1
+        pts[f["home_id"]][1] += hg
+        pts[f["home_id"]][2] += ag
+        pts[f["away_id"]][1] += ag
+        pts[f["away_id"]][2] += hg
+        if hg > ag:
+            pts[f["home_id"]][0] += 3
+        elif ag > hg:
+            pts[f["away_id"]][0] += 3
+        else:
+            pts[f["home_id"]][0] += 1
+            pts[f["away_id"]][0] += 1
+    return sorted(pts.items(), key=lambda kv: (-kv[1][0], kv[1][1] - kv[1][2], -kv[1][1]))
+
+
+def _ko_dates(year: int, title: str) -> dict:
+    if title == "UCL":
+        return {
+            "playoff": (f"{year}-08-19", f"{year}-08-26"),
+            "r16_po": (f"{year+1}-02-11", f"{year+1}-02-18"),
+            "r16": (f"{year+1}-03-10", f"{year+1}-03-17"),
+            "qf": (f"{year+1}-04-07", f"{year+1}-04-14"),
+            "sf": (f"{year+1}-04-28", f"{year+1}-05-05"),
+            "final": (f"{year+1}-05-30", f"{year+1}-05-30"),
+        }
+    if title == "Europa League":
+        return {
+            "r16": (f"{year+1}-03-06", f"{year+1}-03-13"),
+            "qf": (f"{year+1}-04-09", f"{year+1}-04-16"),
+            "sf": (f"{year+1}-04-30", f"{year+1}-05-07"),
+            "final": (f"{year+1}-05-20", f"{year+1}-05-20"),
+        }
+    if title == "Conference League":
+        return {
+            "r16": (f"{year+1}-03-05", f"{year+1}-03-12"),
+            "qf": (f"{year+1}-04-09", f"{year+1}-04-16"),
+            "sf": (f"{year+1}-04-30", f"{year+1}-05-07"),
+            "final": (f"{year+1}-05-21", f"{year+1}-05-21"),
+        }
+    return {
+        "r16": (f"{year}-12-20", f"{year}-12-27"),
+        "qf": (f"{year+1}-03-14", f"{year+1}-03-21"),
+        "sf": (f"{year+1}-04-18", f"{year+1}-04-25"),
+        "final": (f"{year+1}-05-23", f"{year+1}-05-23"),
+    }
+
+
+def _pair_knockout(w, title, ids, ko_round, year):
+    dates = _ko_dates(year, title)
+    d1, d2 = dates.get(ko_round, dates.get("r16"))
+    ids = list(ids)
+    if ko_round == "final" or len(ids) == 2:
+        _add_tie(w, title, ids[0], ids[1], "final", d1, d2, two_leg=False)
+        return
+    if len(ids) % 2:
+        ids = ids[:-1]
+    for i in range(0, len(ids), 2):
+        _add_tie(w, title, ids[i], ids[i + 1], ko_round, d1, d2, two_leg=True)
+
+
 def seed_continental(w: dict, year: int) -> None:
     if not w["meta"].get("europe_on"):
         w["fixtures"] = [f for f in w["fixtures"] if f.get("cup") not in CONTINENTAL]
@@ -288,91 +417,130 @@ def seed_continental(w: dict, year: int) -> None:
     tickets = w["meta"].get("tickets") or {}
     if not tickets:
         return
-    fid = 1 + max((f["id"] for f in w["fixtures"] if isinstance(f.get("id"), int)), default=0)
     rng = random.Random(year * 13)
     ucl_dates = [
-        f"{year}-09-09", f"{year}-10-14", f"{year}-10-21", f"{year}-11-04",
-        f"{year}-11-25", f"{year}-12-09", f"{year+1}-01-20", f"{year+1}-01-27",
+        f"{year}-09-16", f"{year}-10-01", f"{year}-10-22", f"{year}-11-05",
+        f"{year}-11-26", f"{year}-12-10", f"{year+1}-01-21", f"{year+1}-01-28",
     ]
     uel_dates = [
-        f"{year}-09-17", f"{year}-10-02", f"{year}-10-23", f"{year}-11-06",
-        f"{year}-11-27", f"{year}-12-11", f"{year+1}-01-22", f"{year+1}-01-29",
+        f"{year}-09-18", f"{year}-10-02", f"{year}-10-23", f"{year}-11-06",
+        f"{year}-11-27", f"{year}-12-11",
     ]
     uecl_dates = [
         f"{year}-10-02", f"{year}-10-23", f"{year}-11-06", f"{year}-11-27",
         f"{year}-12-11", f"{year+1}-02-19",
     ]
-    if not any(f.get("cup") == "UCL" for f in w["fixtures"]):
-        fid = _league_phase(w, "UCL", list(tickets.get("UCL") or []), year, ucl_dates, fid, rng)
-    if not any(f.get("cup") == "Europa League" for f in w["fixtures"]):
-        fid = _league_phase(w, "Europa League", list(tickets.get("Europa League") or []), year, uel_dates, fid, rng)
-    if not any(f.get("cup") == "Conference League" for f in w["fixtures"]):
-        fid = _league_phase(w, "Conference League", list(tickets.get("Conference League") or []), year, uecl_dates, fid, rng)
-    if not any(f.get("cup") == "CAF Champions League" for f in w["fixtures"]):
-        caf = list(tickets.get("CAF Champions League") or [])
-        rng2 = random.Random(year * 17)
-        rng2.shuffle(caf)
-        gdate = f"{year}-11-22"
-        for i in range(0, len(caf) - 1, 2):
-            w["fixtures"].append({
-                "id": fid, "league_id": 0, "cup": "CAF Champions League", "phase": "group",
-                "round": 1, "week": 0, "date": gdate,
-                "home_id": caf[i], "away_id": caf[i + 1], "played": False,
-            })
-            fid += 1
-    return
-    auto = eur[:32]
-    play = eur[32:40]
-    fid = 1 + max((f["id"] for f in w["fixtures"]), default=0)
-    qdate = f"{year}-08-26"
-    winners = list(auto)
-    rng = random.Random(year * 13)
-    for i in range(0, len(play) - 1, 2):
-        w["fixtures"].append({
-            "id": fid, "league_id": 0, "cup": "UCL", "phase": "qualifying",
-            "round": 0, "week": 0, "date": qdate,
-            "home_id": play[i]["id"], "away_id": play[i + 1]["id"], "played": False,
-        })
-        fid += 1
-        winners.append(play[i])
-    field = [c["id"] for c in winners[:36]]
-    rng.shuffle(field)
-    days = [14, 35, 42, 56, 77, 91, 126, 133]
-    used = {cid: 0 for cid in field}
-    made = set()
-    for md, off in enumerate(days, 1):
-        dt = f"{year}-{8 + (off // 31):02d}-{max(1, off % 28):02d}"
-        if md >= 7:
-            dt = f"{year+1}-01-{10 if md==7 else 27}"
-        pool = field[:]
-        rng.shuffle(pool)
-        for i in range(0, min(len(pool) - 1, 35), 2):
-            a, b = pool[i], pool[i + 1]
-            key = tuple(sorted((a, b, md)))
-            if key in made or used[a] >= 8 or used[b] >= 8:
+    ucl = list(tickets.get("UCL") or [])
+    if ucl and not any(f.get("cup") == "UCL" for f in w["fixtures"]):
+        if len(ucl) > 36:
+            auto, play = ucl[:32], ucl[32:]
+            if len(play) % 2:
+                auto.append(play.pop())
+            w["meta"]["ucl_auto"] = auto
+            d1, d2 = _ko_dates(year, "UCL")["playoff"]
+            for i in range(0, len(play), 2):
+                _add_tie(w, "UCL", play[i], play[i + 1], "playoff", d1, d2, True)
+        else:
+            _league_phase(w, "UCL", ucl[:36], year, ucl_dates, _fid(w), rng)
+    el = list(tickets.get("Europa League") or [])
+    if el and not any(f.get("cup") == "Europa League" for f in w["fixtures"]):
+        if len(el) >= 16:
+            _league_phase(w, "Europa League", el[:36], year, uel_dates, _fid(w), rng)
+        elif len(el) >= 8:
+            _pair_knockout(w, "Europa League", el[:8], "qf", year)
+        elif len(el) >= 2:
+            _pair_knockout(w, "Europa League", el[:4] if len(el) >= 4 else el, "sf" if len(el) >= 4 else "final", year)
+    cl = list(tickets.get("Conference League") or [])
+    if cl and not any(f.get("cup") == "Conference League" for f in w["fixtures"]):
+        if len(cl) >= 16:
+            _pair_knockout(w, "Conference League", cl[:16], "r16", year)
+        elif len(cl) >= 8:
+            _pair_knockout(w, "Conference League", cl[:8], "qf", year)
+    caf = list(tickets.get("CAF Champions League") or [])
+    if caf and not any(f.get("cup") == "CAF Champions League" for f in w["fixtures"]):
+        if len(caf) >= 16:
+            _pair_knockout(w, "CAF Champions League", caf[:16], "r16", year)
+        elif len(caf) >= 2:
+            _pair_knockout(w, "CAF Champions League", caf[:8] if len(caf) >= 8 else caf, "qf" if len(caf) >= 8 else "sf", year)
+    advance_europe(w)
+
+
+def advance_europe(w: dict) -> None:
+    year = int(w["meta"].get("season_start_year", 2026))
+    rng = random.Random(year * 19 + 3)
+    ucl_dates = [
+        f"{year}-09-16", f"{year}-10-01", f"{year}-10-22", f"{year}-11-05",
+        f"{year}-11-26", f"{year}-12-10", f"{year+1}-01-21", f"{year+1}-01-28",
+    ]
+    playoff = [f for f in w["fixtures"] if f.get("cup") == "UCL" and f.get("ko_round") == "playoff"]
+    if playoff and all(f.get("played") for f in playoff) and not any(
+        f.get("cup") == "UCL" and f.get("phase") == "league" for f in w["fixtures"]
+    ):
+        by_tie: dict[str, list] = {}
+        for f in playoff:
+            by_tie.setdefault(f.get("tie", str(f["id"])), []).append(f)
+        winners = [wid for legs in by_tie.values() if (wid := _tie_winner(legs))]
+        field = list(w["meta"].get("ucl_auto") or []) + winners
+        _league_phase(w, "UCL", field[:36], year, ucl_dates, _fid(w), rng)
+        add_news(w, "UCL league phase drawn after the playoffs.", "wire", True, club_id=None)
+
+    for title in ("UCL", "Europa League", "Conference League", "CAF Champions League"):
+        league = [f for f in w["fixtures"] if f.get("cup") == title and f.get("phase") in ("league", "group")]
+        kos = [f for f in w["fixtures"] if f.get("cup") == title and f.get("phase") == "knockout"]
+        if league and all(f.get("played") for f in league) and not any(f.get("ko_round") in ("r16", "r16_po", "qf") for f in kos):
+            order = [cid for cid, _ in europe_table(w, title)]
+            if title == "UCL" and len(order) >= 24:
+                seeds, rest = order[:8], order[8:24]
+                d1, d2 = _ko_dates(year, "UCL")["r16_po"]
+                for i in range(8):
+                    _add_tie(w, "UCL", rest[i], rest[-(i + 1)], "r16_po", d1, d2, True)
+                w["meta"]["ucl_seeds"] = seeds
+                add_news(w, "UCL knockout playoffs set (9th–24th). 25th–36th are out.", "wire", True, club_id=None)
+            elif len(order) >= 16:
+                _pair_knockout(w, title, order[:16], "r16", year)
+            elif len(order) >= 8:
+                _pair_knockout(w, title, order[:8], "qf", year)
+
+        po = [f for f in kos if f.get("ko_round") == "r16_po"]
+        if title == "UCL" and po and all(f.get("played") for f in po) and not any(f.get("ko_round") == "r16" for f in kos):
+            by_tie = {}
+            for f in po:
+                by_tie.setdefault(f.get("tie", str(f["id"])), []).append(f)
+            winners = [wid for legs in by_tie.values() if (wid := _tie_winner(legs))]
+            seeds = list(w["meta"].get("ucl_seeds") or [])
+            winners = winners[:8]
+            pair = []
+            for i in range(min(8, len(seeds), len(winners))):
+                pair.extend([seeds[i], winners[-(i + 1)]])
+            if len(pair) >= 2:
+                _pair_knockout(w, "UCL", pair, "r16", year)
+
+        for rnd, nxt in (("r16", "qf"), ("qf", "sf"), ("sf", "final")):
+            legs = [f for f in w["fixtures"] if f.get("cup") == title and f.get("ko_round") == rnd]
+            if not legs or any(not f.get("played") for f in legs):
                 continue
-            w["fixtures"].append({
-                "id": fid, "league_id": 0, "cup": "UCL", "phase": "league",
-                "round": md, "week": 0, "date": dt,
-                "home_id": a, "away_id": b, "played": False,
-            })
-            fid += 1
-            used[a] += 1
-            used[b] += 1
-            made.add(key)
-    afr = [c for c in w["clubs"] if c.get("nation") in SCOUT_REGIONS["africa"] or c["league_id"] >= 6]
-    afr.sort(key=lambda c: -float(c.get("reputation", 60)))
-    sixteen = [c["id"] for c in afr[:16]]
-    rng2 = random.Random(year * 17)
-    rng2.shuffle(sixteen)
-    gdate = f"{year}-11-22"
-    for i in range(0, 16, 2):
-        w["fixtures"].append({
-            "id": fid, "league_id": 0, "cup": "CAF Champions League", "phase": "group",
-            "round": 1, "week": 0, "date": gdate,
-            "home_id": sixteen[i], "away_id": sixteen[i + 1], "played": False,
-        })
-        fid += 1
+            if any(f.get("cup") == title and f.get("ko_round") == nxt for f in w["fixtures"]):
+                continue
+            by_tie = {}
+            for f in legs:
+                by_tie.setdefault(f.get("tie") or f"{f['home_id']}-{f['away_id']}", []).append(f)
+            winners = [wid for group in by_tie.values() if (wid := _tie_winner(group))]
+            if len(winners) >= 2:
+                _pair_knockout(w, title, winners, nxt, year)
+            elif len(winners) == 1:
+                add_news(w, f"{club_name(w, winners[0])} win the {title}.", "wire", True, club_id=None)
+                if winners[0] == w.get("user", {}).get("club_id"):
+                    add_trophy(w, title)
+
+        finals = [f for f in w["fixtures"] if f.get("cup") == title and f.get("ko_round") == "final" and f.get("played")]
+        if finals:
+            f = finals[0]
+            hg, ag = int(f.get("home_goals", 0)), int(f.get("away_goals", 0))
+            winner = f["home_id"] if hg >= ag else f["away_id"]
+            if not any(t.get("title") == title and t.get("season") == w["meta"].get("season") for t in w.get("user", {}).get("trophies", [])):
+                add_news(w, f"{club_name(w, winner)} win the {title}.", "wire", True, club_id=None)
+                if winner == w.get("user", {}).get("club_id"):
+                    add_trophy(w, title)
 
 
 def league_place(w: dict, cid: int) -> int:
@@ -1146,6 +1314,10 @@ def play_fixture(w: dict, fid: int) -> dict:
             continue_cups(w)
         except Exception:
             pass
+        try:
+            advance_europe(w)
+        except Exception:
+            pass
     return fx
 
 
@@ -1444,7 +1616,7 @@ def _first_cup_rounds(w: dict, existing: list, year: int) -> list:
             rng.shuffle(draw)
             if len(draw) % 2:
                 draw.pop()
-            start = date(year, 9, 23) if kind == "lc" else date(year, 10, 7)
+            start = date(year, 8, 26) if kind == "lc" else date(year, 9, 16)
             for i in range(0, len(draw), 2):
                 extra.append({
                     "id": fid,
@@ -1485,6 +1657,7 @@ def continue_cups(w: dict) -> None:
                 hg, ag = matches[0].get("home_goals", 0), matches[0].get("away_goals", 0)
                 winner = matches[0]["home_id"] if hg >= ag else matches[0]["away_id"]
                 add_news(w, f"{club_name(w, winner)} win the {title}.", "wire", True, club_id=None)
+                w.setdefault("meta", {}).setdefault("cup_winners", {})[str(lid)] = winner
                 if winner == w.get("user", {}).get("club_id"):
                     add_trophy(w, title)
             continue
@@ -1497,7 +1670,10 @@ def continue_cups(w: dict) -> None:
         byes = w.setdefault("cup_byes", {}).setdefault(title, [])
         winners.extend(byes)
         w["cup_byes"][title] = []
-        nxt = fmt_d(parse_d(last_date) + timedelta(days=21))
+        left = len(winners) + (1 if len(winners) % 2 else 0)
+        label = "final" if left <= 2 else "sf" if left <= 4 else "qf" if left <= 8 else "r16" if left <= 16 else "r32"
+        gap = {"r32": 21, "r16": 28, "qf": 35, "sf": 28, "final": 21}.get(label, 21)
+        nxt = fmt_d(parse_d(last_date) + timedelta(days=gap))
         i = 0
         while i + 1 < len(winners):
             w["fixtures"].append({
@@ -1505,6 +1681,7 @@ def continue_cups(w: dict) -> None:
                 "league_id": lid,
                 "cup": title,
                 "phase": "knockout",
+                "ko_round": label,
                 "round": rnd + 1,
                 "week": 0,
                 "date": nxt,
