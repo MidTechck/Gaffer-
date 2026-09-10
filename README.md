@@ -1,58 +1,30 @@
 # Gaffer
 
-Unofficial 2026–27 football season manager. Fan simulation.
+Football manager you run in a browser. Season 2026–27 datapack. Not affiliated with any league, club, or other game.
 
-Premier League squads use publicly listed 2026–27 names. Ratings are estimates.
-La Liga, Serie A and Bundesliga use real 2026–27 club lists with mixed known stars and generated depth players.
-Not affiliated with any league, club or other game.
-
-## Termux
+## Play on a phone (Termux)
 
 ```bash
-termux-setup-storage
-cd ~/storage/shared
-unzip Gaffer.zip
-cd Gaffer
+pkg install git python
+git clone https://github.com/MidTechck/Gaffer-.git
+cd Gaffer-
 python run.py
 ```
 
-Open `http://127.0.0.1:8765` in the phone browser.
+Open `http://127.0.0.1:8765`
 
-Python 3.10+ only. No pip packages.
+Same Wi-Fi: other devices use `http://YOUR_PHONE_IP:8765`
 
-## Play
+Python 3.10+. No pip packages.
 
-1. Pick a Premier League club.
-2. Game plan — formation, style, tap cards to change the XI.
-3. Matchday — play the next fixture.
-4. Table / schedule — league picture.
+## Season rules
 
-XI strength is overall × natural position × fitness × form. Your best two outfield players carry extra weight. Sit them and the number drops more than sitting a squad man.
+- Year 1: league + domestic cups only. No UCL / Europa / Conference / CAF.
+- After the season: 1st–5th → UCL, 6th → Europa, 7th–8th → Conference. One club, one ticket.
+- Africa: top 2 per league → CAF from year 2.
 
-## Saves
+## Railway
 
-Club page → Save writes `saves/career1.json`.
-
-## GitHub then Railway
-
-On the phone (Termux) after unzip:
-
-```bash
-pkg install git
-cd ~/storage/shared/Download/Gaffer
-git init
-git add .
-git commit -m "Gaffer"
-```
-
-On GitHub: New repository named `Gaffer` (do not add a README on the website). Then:
-
-```bash
-git remote add origin https://github.com/YOUR_USER/Gaffer.git
-git branch -M main
-git push -u origin main
-```
-
-Railway: New project → Deploy from GitHub → pick `Gaffer`.  
-Start command is already in `Procfile`: `web: python run.py`  
-It uses `$PORT`. Add a volume mounted at `/app/saves` if you want rooms to survive restarts.
+New project → Deploy from GitHub → `MidTechck/Gaffer-`  
+Procfile: `web: python run.py` (uses `$PORT`)  
+Add a volume at `/app/saves` if rooms should survive restarts.

@@ -9,12 +9,13 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from engine.badges import svg as badge_svg
-from engine.match import FORMATIONS, auto_xi, simulate_match, xi_strength
+from engine.match import FORMATIONS, apply_decider, auto_xi, simulate_match, xi_strength
 from engine import press
 
 
 def badge(club: dict, size: int = 28) -> str:
     return badge_svg(club or {}, size)
+from engine import coaches as CH
 from engine import sponsors as SPON
 from engine.ratings import age_from_birth, compute_value, compute_wage, condition_tick, grow_skills, growth_delta, staff_wage
 
@@ -22,15 +23,42 @@ from engine.ratings import age_from_birth, compute_value, compute_wage, conditio
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _parse_json_text(raw: str) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        pass
+    cleaned = "".join(ch if ch >= " " or ch in "\n\r\t" else " " for ch in raw)
+    return json.loads(cleaned, strict=False)
+
+
 def load_json(path: Path) -> dict:
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        return _parse_json_text(raw)
+    except json.JSONDecodeError:
+        bak = path.with_suffix(path.suffix + ".bak")
+        if bak.is_file():
+            return _parse_json_text(bak.read_text(encoding="utf-8", errors="replace"))
+        raise
 
 
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    blob = json.dumps(data, indent=2, ensure_ascii=True, default=str)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(blob, encoding="utf-8")
+    if path.is_file():
+        bak = path.with_suffix(path.suffix + ".bak")
+        try:
+            bak.write_bytes(path.read_bytes())
+        except OSError:
+            pass
+    tmp.replace(path)
 
 
 def new_career(pack: dict, club_id: int, manager_name: str, profile: dict | None = None) -> dict:
@@ -195,7 +223,9 @@ def wage_bill(w: dict, cid: int) -> int:
 
 
 def club_staff_wage(w: dict, cid: int) -> int:
-    return staff_wage(int(club(w, cid).get("reputation", 70)))
+    base = staff_wage(int(club(w, cid).get("reputation", 70)))
+    extra = sum(int(x.get("wage", 0)) for x in w.get("coaches", []) if x.get("club_id") == cid)
+    return base + extra
 
 
 CONTINENTAL = {"UCL", "Europa League", "Conference League", "CAF Champions League"}
@@ -322,6 +352,9 @@ def _add_tie(w, title, a, b, ko_round, d1, d2, two_leg=True):
 def _tie_winner(legs: list) -> int | None:
     if any(not f.get("played") for f in legs):
         return None
+    last = max(legs, key=lambda x: (x.get("leg", 1), x.get("date", "")))
+    if last.get("winner_id"):
+        return int(last["winner_id"])
     g = {}
     for f in legs:
         g[f["home_id"]] = g.get(f["home_id"], 0) + int(f.get("home_goals", 0))
@@ -332,10 +365,8 @@ def _tie_winner(legs: list) -> int | None:
     a, b = ids[0], ids[1]
     if g[a] != g[b]:
         return a if g[a] > g[b] else b
-    last = max(legs, key=lambda x: x.get("date", ""))
-    ha, aa = int(last.get("home_goals", 0)), int(last.get("away_goals", 0))
-    if ha != aa:
-        return last["home_id"] if ha > aa else last["away_id"]
+    if last.get("pens_home") is not None:
+        return last["home_id"] if int(last["pens_home"]) > int(last.get("pens_away") or 0) else last["away_id"]
     return last["home_id"] if random.random() < 0.5 else last["away_id"]
 
 
@@ -397,17 +428,40 @@ def _ko_dates(year: int, title: str) -> dict:
     }
 
 
+def _clean_ids(ids) -> list[int]:
+    out: list[int] = []
+    seen = set()
+    for raw in ids:
+        try:
+            cid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if cid and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
 def _pair_knockout(w, title, ids, ko_round, year):
     dates = _ko_dates(year, title)
     d1, d2 = dates.get(ko_round, dates.get("r16"))
-    ids = list(ids)
-    if ko_round == "final" or len(ids) == 2:
-        _add_tie(w, title, ids[0], ids[1], "final", d1, d2, two_leg=False)
+    ids = _clean_ids(ids)
+    if len(ids) < 2:
         return
-    if len(ids) % 2:
-        ids = ids[:-1]
-    for i in range(0, len(ids), 2):
-        _add_tie(w, title, ids[i], ids[i + 1], ko_round, d1, d2, two_leg=True)
+    # 1st vs last, 2nd vs 2nd last — big clubs do not all meet in QF
+    seeded = ids[:]
+    pairs = []
+    while len(seeded) >= 2:
+        a, b = seeded.pop(0), seeded.pop()
+        if a == b:
+            continue
+        pairs.append((a, b))
+    if ko_round == "final" or len(pairs) == 1:
+        a, b = pairs[0]
+        _add_tie(w, title, a, b, "final" if ko_round == "final" or len(ids) == 2 else ko_round, d1, d2, two_leg=(ko_round != "final"))
+        return
+    for a, b in pairs:
+        _add_tie(w, title, a, b, ko_round, d1, d2, two_leg=True)
 
 
 def seed_continental(w: dict, year: int) -> None:
@@ -523,8 +577,9 @@ def advance_europe(w: dict) -> None:
                 continue
             by_tie = {}
             for f in legs:
-                by_tie.setdefault(f.get("tie") or f"{f['home_id']}-{f['away_id']}", []).append(f)
-            winners = [wid for group in by_tie.values() if (wid := _tie_winner(group))]
+                key = f.get("tie") or f"solo-{min(f['home_id'], f['away_id'])}-{max(f['home_id'], f['away_id'])}"
+                by_tie.setdefault(key, []).append(f)
+            winners = _clean_ids(wid for group in by_tie.values() if (wid := _tie_winner(group)))
             if len(winners) >= 2:
                 _pair_knockout(w, title, winners, nxt, year)
             elif len(winners) == 1:
@@ -535,8 +590,7 @@ def advance_europe(w: dict) -> None:
         finals = [f for f in w["fixtures"] if f.get("cup") == title and f.get("ko_round") == "final" and f.get("played")]
         if finals:
             f = finals[0]
-            hg, ag = int(f.get("home_goals", 0)), int(f.get("away_goals", 0))
-            winner = f["home_id"] if hg >= ag else f["away_id"]
+            winner = f.get("winner_id") or (f["home_id"] if int(f.get("home_goals", 0)) > int(f.get("away_goals", 0)) else f["away_id"])
             if not any(t.get("title") == title and t.get("season") == w["meta"].get("season") for t in w.get("user", {}).get("trophies", [])):
                 add_news(w, f"{club_name(w, winner)} win the {title}.", "wire", True, club_id=None)
                 if winner == w.get("user", {}).get("club_id"):
@@ -854,14 +908,27 @@ def try_sell(w: dict, pid: int) -> str:
         return "Not yours."
     if not window_open(w):
         return "Window is shut."
+    place = league_place(w, uid)
+    if place >= 16:
+        add_news(w, f"{place_word(place)} — board froze sales. You cannot list players from 16th down.", "desk", True)
+        return "frozen"
+    desperate = place >= 16
+    fee_mul = 0.68 if desperate else 0.95
+    fee = int(p.get("value", 1_000_000) * fee_mul)
     buyers = [c for c in w["clubs"] if c["id"] != uid]
     random.shuffle(buyers)
     for c in buyers:
-        ok, _, fee = can_buy(w, c["id"], {**p, "club_id": uid})
-        if ok:
-            open_offer(w, pid, c["id"], 3, int(p.get("value", fee) * 0.95))
-            add_news(w, f"{p['last_name']} offered out. Clubs are talking.", "desk", True)
-            return "listed"
+        if desperate:
+            if c.get("budget", 0) >= fee * 0.4 and len(squad(w, c["id"])) < 28:
+                open_offer(w, pid, c["id"], 3, fee)
+                add_news(w, f"{place_word(place)} — {p['last_name']} listed cheap. Clubs are circling.", "desk", True)
+                return "listed"
+        else:
+            ok, _, auto = can_buy(w, c["id"], {**p, "club_id": uid})
+            if ok:
+                open_offer(w, pid, c["id"], 3, int(auto * fee_mul))
+                add_news(w, f"{p['last_name']} offered out. Clubs are talking.", "desk", True)
+                return "listed"
     add_news(w, f"No club opened talks for {p['last_name']}.", "desk", True)
     return "no buyer"
 
@@ -876,23 +943,145 @@ COACH_NAMES = [
 def ensure_staff(w: dict) -> None:
     styles = ["possession", "balanced", "quick_counter", "long_ball", "park_bus"]
     forms = list(FORMATIONS)
-    used = {c.get("coach") for c in w["clubs"]}
-    names = [n for n in COACH_NAMES]
-    random.shuffle(names)
-    i = 0
+    have = w.get("coaches") or []
+    named_n = sum(1 for x in have if x.get("named"))
+    if len(have) < 180 or named_n < 80:
+        packed = CH.pack_coaches(max(260, len(w.get("clubs") or []) + 80))
+        keep = [x for x in have if x.get("club_id")]
+        used_names = {(x.get("first_name"), x.get("last_name")) for x in keep}
+        used_ids = {x["id"] for x in keep}
+        nid = 1 + max(used_ids or [0])
+        for c in packed:
+            key = (c.get("first_name"), c.get("last_name"))
+            if key in used_names:
+                continue
+            c["id"] = nid
+            nid += 1
+            keep.append(c)
+            used_names.add(key)
+        w["coaches"] = keep
+    free = [x for x in w["coaches"] if not x.get("club_id")]
+    random.shuffle(free)
+    fi = 0
     for c in w["clubs"]:
-        if not c.get("coach"):
-            while i < len(names) and names[i] in used:
-                i += 1
-            c["coach"] = names[i % len(names)] if names else "Staff"
-            used.add(c["coach"])
-            i += 1
         c.setdefault("style", random.choice(styles))
         c.setdefault("formation", random.choice(forms))
         c.setdefault("stance", random.choice(["attacking", "balanced", "defensive"]))
         c.setdefault("bank_rate", 0.02)
         if not c.get("sponsors"):
             c["sponsors"] = [dict(random.choice(SPON.CATALOG))]
+        if not c.get("coach_id") and fi < len(free):
+            pick = free[fi]
+            fi += 1
+            pick["club_id"] = c["id"]
+            pick["role"] = "head"
+            pick["years"] = max(1, int(pick.get("years", 2)))
+            c["coach_id"] = pick["id"]
+            c["coach"] = CH.display(pick)
+        elif c.get("coach_id"):
+            hc = next((x for x in w["coaches"] if x["id"] == c["coach_id"]), None)
+            if hc:
+                c["coach"] = CH.display(hc)
+
+
+def club_coach(w: dict, cid: int, role: str = "head") -> dict | None:
+    return next((x for x in w.get("coaches", []) if x.get("club_id") == cid and x.get("role") == role), None)
+
+
+def coach_boost_for(w: dict, cid: int) -> float:
+    style = club(w, cid).get("style", "balanced")
+    if w.get("user", {}).get("club_id") == cid:
+        style = w["user"].get("style", style)
+    return CH.boost(club_coach(w, cid, "head"), style) + 0.45 * CH.boost(club_coach(w, cid, "assistant"), style)
+
+
+COACH_RANK = {
+    "E": {"E"},
+    "D": {"E", "D"},
+    "C": {"E", "D", "C"},
+    "B": {"E", "D", "C", "B"},
+    "A": {"E", "D", "C", "B", "A"},
+    "A+": {"E", "D", "C", "B", "A", "A+"},
+    "S": {"E", "D", "C", "B", "A", "A+", "S"},
+}
+
+
+def can_hire_coach(w: dict, cid: int, coach: dict) -> tuple[bool, str]:
+    rank = team_rank(w, cid)
+    allow = COACH_RANK.get(rank, {"E", "D"})
+    lvl = coach.get("level", "C")
+    if lvl not in allow:
+        return False, f"Rank {rank} cannot hire a {lvl} coach."
+    fee = int(coach.get("wage", 20_000)) * (8 if coach.get("named") else 4)
+    if club(w, cid).get("budget", 0) < fee:
+        return False, "Not enough to buy the contract."
+    return True, "ok"
+
+
+def hire_coach(w: dict, oid: int, role: str = "head") -> str:
+    ensure_staff(w)
+    uid = w["user"]["club_id"]
+    c = next((x for x in w["coaches"] if x["id"] == oid), None)
+    if not c or c.get("club_id"):
+        return "not free"
+    if club_coach(w, uid, role):
+        return "slot full"
+    ok, why = can_hire_coach(w, uid, c)
+    if not ok:
+        add_news(w, why, "desk", True)
+        return why
+    fee = int(c.get("wage", 20_000)) * (8 if c.get("named") else 4)
+    club(w, uid)["budget"] -= fee
+    c["club_id"] = uid
+    c["role"] = role
+    c["years"] = max(2, int(c.get("years", 2)))
+    if role == "head":
+        club(w, uid)["coach_id"] = c["id"]
+        club(w, uid)["coach"] = CH.display(c)
+        club(w, uid)["style"] = c.get("style", "balanced")
+    else:
+        club(w, uid)["assistant_id"] = c["id"]
+    add_news(w, f"Hired {CH.display(c)} as {role} ({c['level']}, {c['years']} yrs, £{c['wage']:,}/w).", "desk", True)
+    return "ok"
+
+
+def release_coach(w: dict, role: str = "head") -> str:
+    uid = w["user"]["club_id"]
+    c = club_coach(w, uid, role)
+    if not c:
+        return "none"
+    pay = int(c.get("wage", 0)) * 20 * max(1, int(c.get("years", 1)))
+    club(w, uid)["budget"] -= pay
+    c["club_id"] = 0
+    c["role"] = "free"
+    if role == "head":
+        asst = club_coach(w, uid, "assistant")
+        if asst:
+            asst["role"] = "head"
+            club(w, uid)["coach_id"] = asst["id"]
+            club(w, uid)["coach"] = CH.display(asst)
+            club(w, uid)["assistant_id"] = None
+            club(w, uid)["style"] = asst.get("style", club(w, uid).get("style"))
+            add_news(w, f"Released {CH.display(c)}. {CH.display(asst)} is now head coach.", "desk", True)
+        else:
+            club(w, uid)["coach_id"] = None
+            club(w, uid)["coach"] = "—"
+            add_news(w, f"Released {CH.display(c)}. Compensation £{pay:,}. Hire a head coach.", "desk", True)
+    else:
+        club(w, uid)["assistant_id"] = None
+        add_news(w, f"Released assistant {CH.display(c)}. Compensation £{pay:,}.", "desk", True)
+    return "ok"
+
+
+def renew_coach(w: dict, role: str = "head") -> str:
+    uid = w["user"]["club_id"]
+    c = club_coach(w, uid, role)
+    if not c:
+        return "none"
+    c["years"] = max(int(c.get("years", 1)), 0) + 2
+    c["wage"] = int(c.get("wage", 20_000) * 1.12)
+    add_news(w, f"Renewed {CH.display(c)} — {c['years']} yrs at £{c['wage']:,}/w.", "desk", True)
+    return "ok"
 
 
 def _weak_role(w: dict, cid: int) -> str:
@@ -1248,6 +1437,71 @@ def next_user_fixture(w: dict) -> dict | None:
     return upcoming[0] if upcoming else None
 
 
+def _cup_needs_decider(w: dict, fx: dict, hg: int, ag: int) -> bool:
+    if not fx.get("cup") or fx.get("phase") in ("league", "group"):
+        return False
+    if fx.get("leg") == 1:
+        return False
+    if fx.get("leg") == 2:
+        first = next(
+            (f for f in w["fixtures"] if f.get("tie") == fx.get("tie") and f.get("leg") == 1 and f.get("played")),
+            None,
+        )
+        if not first:
+            return hg == ag
+        g = {fx["home_id"]: hg, fx["away_id"]: ag}
+        g[first["home_id"]] = g.get(first["home_id"], 0) + int(first.get("home_goals", 0))
+        g[first["away_id"]] = g.get(first["away_id"], 0) + int(first.get("away_goals", 0))
+        return g[fx["home_id"]] == g[fx["away_id"]]
+    return hg == ag
+
+
+def _europe_gap(w: dict, fx: dict, home: bool) -> float:
+    if fx.get("cup") not in CONTINENTAL:
+        return 0.0
+    ho = squad_ovr(w, fx["home_id"])
+    ao = squad_ovr(w, fx["away_id"])
+    gap = ho - ao
+    if home and gap > 5:
+        return min(4.5, (gap - 5) * 0.45)
+    if not home and gap < -5:
+        return min(4.5, (-gap - 5) * 0.45)
+    return 0.0
+
+
+def repair_europe(w: dict) -> None:
+    dirty = False
+    keep = []
+    for f in w["fixtures"]:
+        if f.get("cup") and f.get("home_id") == f.get("away_id"):
+            dirty = True
+            continue
+        keep.append(f)
+    w["fixtures"] = keep
+    stages = ("r16", "qf", "sf", "final")
+    for title in CONTINENTAL:
+        broken = None
+        for rnd in stages:
+            rows = [f for f in w["fixtures"] if f.get("cup") == title and f.get("ko_round") == rnd]
+            ids = [x for f in rows for x in (f["home_id"], f["away_id"])]
+            if rows and len(ids) != len(set(ids)):
+                broken = rnd
+                break
+        if not broken:
+            continue
+        dirty = True
+        drop = stages[stages.index(broken):]
+        w["fixtures"] = [
+            f for f in w["fixtures"]
+            if not (f.get("cup") == title and f.get("ko_round") in drop)
+        ]
+    if dirty:
+        try:
+            advance_europe(w)
+        except Exception:
+            pass
+
+
 def play_fixture(w: dict, fid: int) -> dict:
     fx = next(f for f in w["fixtures"] if f["id"] == fid)
     if fx.get("played"):
@@ -1290,15 +1544,33 @@ def play_fixture(w: dict, fid: int) -> dict:
         aws, ast = w["user"]["style"], w["user"].get("stance", "balanced")
     else:
         aws, ast = ai_plan(ac, fx["home_id"])
+    seed = fid * 7919 + int(w["meta"]["current_date"].replace("-", ""))
+    user_game = fx["home_id"] == uid or fx["away_id"] == uid
     res = simulate_match(
         home, away, hs, aws, True,
-        seed=fid * 7919 + int(w["meta"]["current_date"].replace("-", "")),
+        seed=seed,
         home_stance=hst, away_stance=ast,
         home_form=hf or "4-3-3", away_form=af or "4-3-3",
+        home_boost=coach_boost_for(w, fx["home_id"]) + _europe_gap(w, fx, True),
+        away_boost=coach_boost_for(w, fx["away_id"]) + _europe_gap(w, fx, False),
+        knockout=False,
+        lite=not user_game,
     )
+    if _cup_needs_decider(w, fx, res["home_goals"], res["away_goals"]):
+        res = apply_decider(res, home, away, seed)
     fx["played"] = True
     fx["home_goals"] = res["home_goals"]
     fx["away_goals"] = res["away_goals"]
+    fx["ft_home"] = res.get("ft_home", res["home_goals"])
+    fx["ft_away"] = res.get("ft_away", res["away_goals"])
+    fx["extra_time"] = bool(res.get("extra_time"))
+    fx["pens_home"] = res.get("pens_home")
+    fx["pens_away"] = res.get("pens_away")
+    side = res.get("winner_side")
+    if side == "home":
+        fx["winner_id"] = fx["home_id"]
+    elif side == "away":
+        fx["winner_id"] = fx["away_id"]
     fx["report"] = {
         "events": res["events"],
         "home_strength": res["home_strength"],
@@ -1306,10 +1578,12 @@ def play_fixture(w: dict, fid: int) -> dict:
         "cards": res["cards"],
         "injuries": res["injuries"],
         "ratings": res["ratings"],
+        "pens": None if res.get("pens_home") is None else f"{res['pens_home']}–{res['pens_away']}",
+        "et": res.get("extra_time"),
     }
     apply_match_consequences(w, fx, home, away, res)
     w["results"].append({"fixture_id": fid, "hg": res["home_goals"], "ag": res["away_goals"]})
-    if fx.get("cup"):
+    if fx.get("cup") and user_game:
         try:
             continue_cups(w)
         except Exception:
@@ -1345,6 +1619,15 @@ def apply_match_consequences(w: dict, fx: dict, home: dict, away: dict, res: dic
                 mood -= 5
             p["morale"] = max(38, min(99, mood))
             p["adaptation"] = min(100, float(p.get("adaptation", 70)) + 1.5)
+            try:
+                agn = age_from_birth(p["birthdate"], w["meta"]["current_date"])
+            except Exception:
+                agn = 25
+            if agn <= 23 and rat >= 7.1 and random.random() < 0.16:
+                p["overall"] = round(min(99.9, float(p["overall"]) + 0.1), 1)
+                p["skills"] = grow_skills(p.get("skills"), 0.1, p.get("roles"))
+            elif agn >= 34 and random.random() < 0.12:
+                p["overall"] = round(max(40.0, float(p["overall"]) - 0.1), 1)
     for inj in res["injuries"]:
         try:
             p = player(w, inj["player_id"])
@@ -1436,6 +1719,73 @@ def heal(w: dict) -> None:
             p["condition"] = condition_tick(float(p.get("condition", 88)), False, False)
 
 
+def skip_phase(w: dict, days: int) -> str:
+    today = parse_d(w["meta"]["current_date"])
+    last = fmt_d(today + timedelta(days=max(1, days)))
+    uid = w.get("user", {}).get("club_id")
+    fx = [
+        f for f in w.get("fixtures", [])
+        if not f.get("played") and w["meta"]["current_date"] < f["date"] <= last
+    ]
+    league = [f for f in fx if not f.get("cup")]
+    cups = [f for f in fx if f.get("cup")]
+    if today.month in (6, 7) and not league:
+        return "preseason"
+    if not fx:
+        return "rest"
+    if cups and not league:
+        return "cups"
+    if league and not cups:
+        return "league"
+    return "mix"
+
+
+def advance_days(w: dict, n: int, stop_before_match: bool = False) -> int:
+    n = max(1, min(100, int(n)))
+    start = parse_d(w["meta"]["current_date"])
+    end = fmt_d(start + timedelta(days=n))
+    bulk = n >= 14
+    guard = 0
+    while w["meta"]["current_date"] < end and guard < n + 40:
+        guard += 1
+        due = [
+            f for f in w["fixtures"]
+            if not f.get("played") and f["date"] <= w["meta"]["current_date"]
+            and (f["home_id"] in human_clubs(w) or f["away_id"] in human_clubs(w))
+        ]
+        if due:
+            play_fixture(w, due[0]["id"])
+            continue
+        if stop_before_match:
+            nxt = next_user_fixture(w)
+            tomorrow = fmt_d(parse_d(w["meta"]["current_date"]) + timedelta(days=1))
+            if nxt and tomorrow > nxt["date"]:
+                break
+        if bulk:
+            heal(w)
+            sim_due_ai(w)
+            d = parse_d(w["meta"]["current_date"]) + timedelta(days=1)
+            w["meta"]["current_date"] = fmt_d(d)
+            if d.weekday() == 0:
+                resolve_offers(w)
+            if d.month == 6 and d.day == 1:
+                season_turnover(w)
+        else:
+            advance_day(w)
+    if parse_d(w["meta"]["current_date"]) > start + timedelta(days=n):
+        w["meta"]["current_date"] = end
+    elif w["meta"]["current_date"] < end and not stop_before_match:
+        w["meta"]["current_date"] = end
+        heal(w)
+        sim_due_ai(w)
+    try:
+        continue_cups(w)
+        advance_europe(w)
+    except Exception:
+        pass
+    return n
+
+
 def advance_day(w: dict) -> None:
     heal(w)
     sim_due_ai(w)
@@ -1491,7 +1841,7 @@ def advance_to_next_match(w: dict) -> dict | None:
     if not target:
         return None
     steps = 0
-    while w["meta"]["current_date"] < target["date"] and steps < 2:
+    while w["meta"]["current_date"] < target["date"] and steps < 90:
         advance_day(w)
         steps += 1
     heal(w)
@@ -1654,8 +2004,8 @@ def continue_cups(w: dict) -> None:
             continue
         if len(matches) <= 1:
             if matches and matches[0].get("played"):
-                hg, ag = matches[0].get("home_goals", 0), matches[0].get("away_goals", 0)
-                winner = matches[0]["home_id"] if hg >= ag else matches[0]["away_id"]
+                m0 = matches[0]
+                winner = m0.get("winner_id") or (m0["home_id"] if int(m0.get("home_goals", 0)) > int(m0.get("away_goals", 0)) else m0["away_id"])
                 add_news(w, f"{club_name(w, winner)} win the {title}.", "wire", True, club_id=None)
                 w.setdefault("meta", {}).setdefault("cup_winners", {})[str(lid)] = winner
                 if winner == w.get("user", {}).get("club_id"):
@@ -1665,8 +2015,7 @@ def continue_cups(w: dict) -> None:
         last_date = matches[0]["date"]
         for m in matches:
             last_date = max(last_date, m["date"])
-            hg, ag = m.get("home_goals", 0), m.get("away_goals", 0)
-            winners.append(m["home_id"] if hg >= ag else m["away_id"])
+            winners.append(m.get("winner_id") or (m["home_id"] if int(m.get("home_goals", 0)) > int(m.get("away_goals", 0)) else m["away_id"]))
         byes = w.setdefault("cup_byes", {}).setdefault(title, [])
         winners.extend(byes)
         w["cup_byes"][title] = []
@@ -1800,6 +2149,27 @@ def season_turnover(w: dict) -> None:
             )
             dest = "as a free agent" if not kid.get("club_id") else f"at {club_name(w, kid['club_id'])}"
             add_news(w, f"{kid['first_name']} {kid['last_name']} (18, {kid['overall']:.0f}) is on the market {dest}.", "desk", True)
+    uid = w.get("user", {}).get("club_id")
+    for ch in w.get("coaches", []):
+        if not ch.get("club_id"):
+            continue
+        ch["years"] = int(ch.get("years", 1)) - 1
+        if ch["years"] > 0:
+            continue
+        own, role = ch.get("club_id"), ch.get("role")
+        add_news(w, f"{CH.display(ch)}'s deal expired.", "desk", own == uid)
+        ch["club_id"] = 0
+        ch["role"] = "free"
+        try:
+            cl = club(w, own)
+        except StopIteration:
+            continue
+        if role == "head":
+            cl["coach_id"] = None
+            cl["coach"] = "—"
+        else:
+            cl["assistant_id"] = None
+    ensure_staff(w)
 
 
 def leaders(w: dict, lid: int, stat: str, n: int = 8) -> list:

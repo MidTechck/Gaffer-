@@ -5,14 +5,16 @@ from __future__ import annotations
 import random
 
 OUTLETS = (
-    "The Whistle",
-    "Pitchline",
-    "Saturday Desk",
-    "North Stand",
-    "Capitol Sport",
-    "Late Kick",
-    "Touchline AM",
-    "Second Ball",
+    "Sky Sports",
+    "BBC Sport",
+    "The Athletic",
+    "ESPN",
+    "L'Équipe",
+    "Marca",
+    "Gazzetta dello Sport",
+    "Goal",
+    "The Guardian",
+    "talkSPORT",
 )
 
 RUMOUR = [

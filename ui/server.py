@@ -78,7 +78,16 @@ def career_for(handler) -> dict | None:
         if key not in worlds:
             fp = ROOT / "saves" / f"user_{account}.json"
             if fp.is_file():
-                worlds[key] = W.load_json(fp)
+                try:
+                    worlds[key] = W.load_json(fp)
+                    STATE.pop("save_error", None)
+                except Exception:
+                    bad = fp.with_suffix(".json.bad")
+                    try:
+                        fp.replace(bad)
+                    except OSError:
+                        pass
+                    STATE["save_error"] = "Last career file was damaged. Start a new career or load another save."
         if key in worlds:
             return bind_seat(worlds[key], account, seat)
     return bind_seat(STATE.get("career"), account, seat)
@@ -122,7 +131,7 @@ def html_page(title: str, body: str, cr: dict | None, body_class: str = "") -> s
         win = "OPEN" if W.window_open(cr) else "SHUT"
         status = f"""
         <header class="top">
-          <div class="brand">GAFFER</div>
+          <div class="brand">M.L26</div>
           <div class="meta">
             <span>{club['name']} · {W.team_rank(cr, club['id'])}</span>
             <span>{cr['meta']['current_date']}</span>
@@ -141,37 +150,57 @@ def html_page(title: str, body: str, cr: dict | None, body_class: str = "") -> s
           <a href="/market">Market</a>
           <a href="/news">News</a>
           <a href="/club">Club</a>
+          <a href="/coaches">Coaches</a>
           <a href="/trophies">Trophies</a>
           <a href="/cups">Cups</a>
           <a href="/ucl">UCL</a>
+          <a href="/settings">Settings</a>
         </nav>
         """
-    lock = "desk-lock"
+    lock = "desk-lock" if cr else "boot-ready"
     if body_class:
-        lock = f"desk-lock {body_class}"
+        lock = f"{lock} {body_class}".strip()
     turn = '<div class="turn"><p>Turn the device sideways</p></div>' if cr else ""
+    boot = """<div id="boot" hidden>
+      <div class="boot-card">
+        <img src="/static/img/icon-192.png" alt="M.L26" width="72" height="72">
+        <p>M.L26</p>
+        <div class="ml-loader" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <strong class="boot-word">LOADING<span>.</span><span>.</span><span>.</span></strong>
+        <div class="boot-bar"><i id="boot-fill"></i></div>
+        <span id="boot-pct">0%</span>
+      </div>
+    </div>"""
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>{title} · Gaffer</title>
+<title>{title} · M.L26</title>
 <link rel="stylesheet" href="/static/css/app.css">
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" href="/static/img/icon-192.png">
+<link rel="apple-touch-icon" href="/static/img/icon-192.png">
+<meta name="theme-color" content="#10182a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 </head>
 <body class="{lock}">
 {status}
+{boot}
 <main class="page">{body}</main>
 {turn}
 <script src="/static/js/plan.js"></script>
 <script src="/static/js/desk.js"></script>
+<script>if("serviceWorker" in navigator){{navigator.serviceWorker.register("/static/sw.js").catch(function(){{}})}}</script>
 </body></html>"""
 
 
 def page_login(msg: str = "") -> str:
     return html_page("Sign in", f"""
     <section class="panel start">
-      <h1>Gaffer</h1>
-      <p class="lede">One account on this phone or on the hosted server.</p>
+      <h1>M.L26</h1>
+      <p class="lede">Manager League 26. One account on this phone or on the hosted server.</p>
       <p class="warn">{msg}</p>
       <form method="post" action="/login" class="stack">
         <label>Username <input name="user" required minlength="3"></label>
@@ -211,13 +240,15 @@ def page_menu(user: str | None = None) -> str:
                 f"<button>Load {fp.stem}</button></form>"
             )
     load = "".join(saves) or "<p class='muted'>No saved careers.</p>"
+    err = f"<p class='warn'>{STATE.get('save_error')}</p>" if STATE.get("save_error") else ""
     pals = "".join(f"<li>{f}</li>" for f in A.friends_of(user)) or "<li class='muted'>None yet.</li>"
     port = A.port()
     link = f"http://{lan_ip()}:{port}"
-    return html_page("Gaffer", f"""
+    return html_page("M.L26", f"""
     <section class="panel start office">
-      <h1>Office · {user}</h1>
+      <h1>M.L26 · {user}</h1>
       <p class="lede">Same world, two clubs, one league. Season keeps looping.</p>
+      {err}
       <p class="muted">{link}</p>
       <div class="hub-grid">
         <a class="tile-btn" href="/new">New career</a>
@@ -243,8 +274,9 @@ def page_menu(user: str | None = None) -> str:
 
 def page_new() -> str:
     groups = []
-    for lg in pack()["leagues"]:
-        clubs = [c for c in pack()["clubs"] if c["league_id"] == lg["id"]]
+    data = pack()
+    for lg in data["leagues"]:
+        clubs = [c for c in data["clubs"] if c["league_id"] == lg["id"]]
         if not clubs:
             continue
         opts = "\n".join(f'<option value="{c["id"]}">{c["name"]}</option>' for c in clubs)
@@ -285,11 +317,12 @@ def page_new() -> str:
         </div>
       </form>
     </section>
-    """, None)
+    """, None, body_class="setup-screen")
 
 
 def page_home(cr: dict) -> str:
     W.repair_home_away(cr)
+    W.ensure_staff(cr)
     W.ensure_cups(cr)
     W.ensure_xi(cr)
     cr.setdefault("seats", {})
@@ -313,8 +346,10 @@ def page_home(cr: dict) -> str:
         hid, aid = nxt["home_id"], nxt["away_id"]
         hx = W.resolve_xi(cr, hid)
         ax = W.resolve_xi(cr, aid)
-        hs = xi_strength(hx, cr["user"]["style"] if hid == cid else "balanced")
-        aws = xi_strength(ax, cr["user"]["style"] if aid == cid else "balanced")
+        hs = xi_strength(hx, cr["user"]["style"] if hid == cid else W.club(cr, hid).get("style", "balanced"))
+        aws = xi_strength(ax, cr["user"]["style"] if aid == cid else W.club(cr, aid).get("style", "balanced"))
+        hs = {**hs, "total": round(hs["total"] + W.coach_boost_for(cr, hid), 1)}
+        aws = {**aws, "total": round(aws["total"] + W.coach_boost_for(cr, aid), 1)}
         venue = "Home" if hid == cid else "Away"
         if today >= nxt["date"]:
             actions = (
@@ -326,6 +361,9 @@ def page_home(cr: dict) -> str:
                 f'<a class="btn" href="/plan">Set XI</a>'
                 f'<form method="post" action="/goto-match" class="inline">'
                 f'<button class="primary" type="submit">Advance to match</button></form>'
+                f'<form method="post" action="/advance/2" class="inline" data-phase="{W.skip_phase(cr, 2)}"><button type="submit">+2 days</button></form>'
+                f'<form method="post" action="/advance/30" class="inline" data-phase="{W.skip_phase(cr, 30)}"><button type="submit">+1 month</button></form>'
+                f'<form method="post" action="/advance/90" class="inline" data-phase="{W.skip_phase(cr, 90)}"><button type="submit">+3 months</button></form>'
             )
         match = f"""
         <div class="hero-fx">
@@ -431,7 +469,7 @@ def page_home(cr: dict) -> str:
         <ul class="feed">{news}</ul>
       </section>
     </div>
-    """, cr, body_class="home-lock")
+    """, cr, body_class="office-bg")
 
 
 def page_team(cr: dict) -> str:
@@ -445,7 +483,7 @@ def page_team(cr: dict) -> str:
         a = int(p.get("season_stats", {}).get("assists", 0))
         sell = (
             f"<form method='post' action='/sell/{p['id']}' class='inline'><button>List</button></form>"
-            if W.window_open(cr) else ""
+            if W.window_open(cr) and W.league_place(cr, cr["user"]["club_id"]) < 16 else ""
         )
         cards.append(
             f"<div class='squad-row'>"
@@ -682,10 +720,12 @@ def page_plan(cr: dict) -> str:
         role = p["roles"][0]["code"] if p.get("roles") else "CM"
         bench.append(player_card(p, role, small=True, slot="bench"))
     st = xi_strength(mapped, style)
+    boost = W.coach_boost_for(cr, u["club_id"])
+    st = {**st, "total": round(st["total"] + boost, 1)}
     opts_f = "".join(f"<option {'selected' if f==form else ''} value='{f}'>{f}</option>" for f in FORMATIONS)
     opts_s = "".join(
         f"<option {'selected' if s==style else ''} value='{s}'>{s}</option>"
-        for s in ("possession", "tiki_taka", "balanced", "quick_counter", "gegenpress", "harambee", "long_ball", "out_wide", "park_bus", "low_block")
+        for s in ("possession", "tiki_taka", "balanced", "quick_counter", "gegenpress", "harambee", "long_ball", "long_ball_counter", "out_wide", "park_bus", "low_block")
     )
     stance = u.get("stance", "balanced")
     opts_t = "".join(
@@ -709,6 +749,7 @@ def page_plan(cr: dict) -> str:
     </div>
     <p class="strength">XI strength <b>{st['total']:.1f}</b>
       · GK {st['gk']:.0f} · DEF {st['def']:.0f} · MID {st['mid']:.0f} · ATT {st['att']:.0f}
+      · coach {boost:+.1f} on {style}
     </p>
     <div class="plan-board">
       <aside class="bench">
@@ -823,10 +864,19 @@ def page_report(cr: dict, fid: int) -> str:
         f"<li>{e.get('text') or e.get('name','')}</li>"
         for e in (fx.get("report") or {}).get("events", [])
     )
+    extra = ""
+    if fx.get("extra_time"):
+        extra += " AET"
+    if fx.get("pens_home") is not None:
+        extra += f" · pens {fx['pens_home']}–{fx['pens_away']}"
+    won = ""
+    if fx.get("winner_id"):
+        won = f"<p class='lede'>Winner: <b>{W.club_name(cr, fx['winner_id'])}</b></p>"
     return html_page("Report", f"""
-    <h1>{W.club_name(cr, fx['home_id'])} {fx.get('home_goals',0)}–{fx.get('away_goals',0)} {W.club_name(cr, fx['away_id'])}</h1>
-    <ul class="feed">{ev or '<li>No goals.</li>'}</ul>
-    <p><a class="btn" href="/home">Office</a> <a class="btn" href="/table">Table</a></p>
+    <h1>{W.club_name(cr, fx['home_id'])} {fx.get('home_goals',0)}–{fx.get('away_goals',0)} {W.club_name(cr, fx['away_id'])}{extra}</h1>
+    {won}
+    <ul class="feed">{ev or '<li>No events.</li>'}</ul>
+    <p><a class="btn" href="/home">Office</a> <a class="btn" href="/table">Table</a> <a class="btn" href="/ucl">UCL</a></p>
     """, cr)
 
 
@@ -1058,20 +1108,44 @@ def page_market(cr: dict, raw_q: str = "") -> str:
             )
         else:
             outgoing.append(f"<li>{line} — {off.get('reply','')}</li>")
+    W.ensure_staff(cr)
+    head = W.club_coach(cr, my, "head")
+    asst = W.club_coach(cr, my, "assistant")
+    mgr_rows = []
+    for c in sorted((x for x in cr.get("coaches", []) if not x.get("club_id")), key=lambda x: -CH_LVL(x))[:10]:
+        ok, why = W.can_hire_coach(cr, my, c)
+        role = "head" if not head else "assistant" if not asst else ""
+        fee = int(c.get("wage", 0)) * (8 if c.get("named") else 4)
+        if ok and role:
+            btn = f"<form method='post' action='/coach/hire/{c['id']}/{role}'><button>Buy {role} £{fee:,}</button></form>"
+        else:
+            btn = f"<span class='muted'>{why if not ok else 'Staff full'}</span>"
+        mgr_rows.append(
+            f"<tr><td>{c['first_name']} {c['last_name']}</td><td>{c.get('nation')}</td>"
+            f"<td>{c.get('level')}</td><td>{c.get('style')}</td><td>£{int(c.get('wage',0)):,}/w</td>"
+            f"<td>{c.get('years')}y</td><td>{btn}</td></tr>"
+        )
     return html_page("Market", f"""
     <h1>Market</h1>
-    <p>Window <b>{win}</b> · Ceiling <b>{cap:.0f}</b> · Bank £{W.club(cr, my)['budget']:,}</p>
-    <div class="market-grid">
-      <section class="panel bids">
-        <h2>Incoming</h2>
-        <ul class="feed">{''.join(incoming) or '<li>No bids for your players.</li>'}</ul>
-        <h2>Your bids</h2>
-        <ul class="feed slim">{''.join(outgoing) or '<li>None live.</li>'}</ul>
+    <p class="plan-sub">Window <b>{win}</b> · Player cap <b>{cap:.0f}</b> · Bank £{W.club(cr, my)['budget']:,}</p>
+    <div class="mkt">
+      <div class="mkt-bids">
+        <section class="panel"><h2>Incoming</h2><ul class="feed">{''.join(incoming) or '<li>No bids for your players.</li>'}</ul></section>
+        <section class="panel"><h2>Your bids</h2><ul class="feed slim">{''.join(outgoing) or '<li>None live.</li>'}</ul></section>
+      </div>
+      <section class="panel">
+        <h2>Managers</h2>
+        <p class="muted">Rank gates staff. E clubs only hire E coaches. Named names cost more.</p>
+        <div class="mkt-table-wrap"><table class="grid slim">
+          <thead><tr><th>Name</th><th>Nat</th><th>Lvl</th><th>Best</th><th>Wage</th><th>Yrs</th><th></th></tr></thead>
+          <tbody>{''.join(mgr_rows) or '<tr><td colspan=7>None free.</td></tr>'}</tbody>
+        </table></div>
       </section>
-      <section class="panel scroll list">
-        <form method="post" action="/scout" class="row tight">
+      <section class="panel">
+        <h2>Players</h2>
+        <form method="post" action="/scout" class="mkt-tools">
           <select name="who">
-            <option value="peter">Peter · E clubs · growth</option>
+            <option value="peter">Peter · E · growth</option>
             <option value="oblak">Oblak · D/C</option>
             <option value="brent">Brent · A/A+</option>
             <option value="s2g">S2G · B to S</option>
@@ -1079,19 +1153,19 @@ def page_market(cr: dict, raw_q: str = "") -> str:
           <select name="region"><option value="africa">Africa</option><option value="europe">Europe</option></select>
           <button>Send scout</button>
         </form>
-        <ul class="feed">{''.join(scout_rows) or "<li>No scout report yet. Send one — they hunt a weak line you can actually sign.</li>"}</ul>
-        <form class="row tight" method="get" action="/market">
+        <ul class="feed slim">{''.join(scout_rows) or "<li>No scout report yet.</li>"}</ul>
+        <form class="mkt-tools" method="get" action="/market">
           <input name="q" value="{q}" placeholder="Player">
           <input name="team" value="{team}" placeholder="Club">
           <input name="nation" value="{nation}" placeholder="Nation">
-          <input name="omin" value="{omin}" placeholder="Min OVR" size="4">
-          <input name="omax" value="{omax}" placeholder="Max OVR" size="4">
+          <input name="omin" value="{omin}" placeholder="Min" size="3">
+          <input name="omax" value="{omax}" placeholder="Max" size="3">
           <button>Search</button>
         </form>
-        <table class="grid">
+        <div class="mkt-table-wrap"><table class="grid slim">
           <thead><tr><th>Pos</th><th>Player</th><th>Club</th><th>OVR</th><th>Value</th><th></th></tr></thead>
           <tbody>{''.join(rows)}</tbody>
-        </table>
+        </table></div>
       </section>
     </div>
     """, cr)
@@ -1110,6 +1184,105 @@ def page_news(cr: dict) -> str:
     <p class="plan-sub">Wire — moves, rumours, injuries. Club mail stays on Home.</p>
     <div class="panel scroll"><ul class="feed">{items}</ul></div>
     """, cr)
+
+
+def _coach_card(c: dict, role: str, hire: str = "") -> str:
+    from engine import coaches as CH
+    play = CH.play_of(c)
+    bars = []
+    for key, label in CH.PLAY_KEYS:
+        n = int(play.get(key, 55))
+        tone = "hi" if n >= 80 else "mid" if n >= 65 else "lo"
+        bars.append(
+            f"<div class='mgr-stat {tone}'><span>{label}</span>"
+            f"<b>{n}</b><i style='--v:{n}%'></i></div>"
+        )
+    hist = "".join(
+        f"<li>{h.get('club')} {h.get('from')}–{h.get('to')} · {h.get('titles',0)} titles</li>"
+        for h in (c.get("history") or [])
+    ) or "<li>No file listed.</li>"
+    return (
+        f"<article class='mgr-card'>"
+        f"<div class='mgr-top'><span class='lvl'>{c.get('level')}</span>"
+        f"<div><h3>{c.get('first_name')} {c.get('last_name')}</h3>"
+        f"<p>{role} · {c.get('nation')} · {c.get('age')} · {'★'*int(c.get('stars',1))}</p></div></div>"
+        f"<p class='mgr-best'>Best {c.get('style')} · £{int(c.get('wage',0)):,}/w · {c.get('years',0)} yrs · {c.get('titles',0)} titles</p>"
+        f"<div class='mgr-stats'>{''.join(bars)}</div>"
+        f"<h4>File</h4><ul class='feed slim'>{hist}</ul>{hire}</article>"
+    )
+
+
+def page_settings(cr: dict) -> str:
+    return html_page("Settings", """
+    <h1>Settings</h1>
+    <div class="panel">
+      <label class="set-row"><input type="checkbox" id="set-music" checked> Music</label>
+      <label class="set-row"><input type="checkbox" id="set-sfx" checked> Button clicks</label>
+      <label class="set-row">Music volume <input type="range" id="set-mvol" min="0" max="100" value="35"></label>
+      <label class="set-row">Click volume <input type="range" id="set-svol" min="0" max="100" value="25"></label>
+      <p class="muted">Playlist: loop1 then loop2, then back to loop1. Saved on this device.</p>
+    </div>
+    """, cr)
+
+
+def page_coaches(cr: dict, raw_q: str = "") -> str:
+    W.ensure_staff(cr)
+    cid = cr["user"]["club_id"]
+    head = W.club_coach(cr, cid, "head")
+    asst = W.club_coach(cr, cid, "assistant")
+    boost = W.coach_boost_for(cr, cid)
+    now = _coach_card(head, "Head coach") if head else "<p class='muted'>No head coach. Hire one.</p>"
+    sec = _coach_card(asst, "Assistant") if asst else "<p class='muted'>No assistant.</p>"
+    acts = []
+    if head:
+        acts.append("<form method='post' action='/coach/renew/head'><button>Renew head</button></form>")
+        acts.append("<form method='post' action='/coach/release/head'><button>Release head</button></form>")
+    if asst:
+        acts.append("<form method='post' action='/coach/renew/assistant'><button>Renew assistant</button></form>")
+        acts.append("<form method='post' action='/coach/release/assistant'><button>Release assistant</button></form>")
+    q = ""
+    if raw_q:
+        q = parse_qs(raw_q.lstrip("?")).get("q", [""])[0].strip().lower()
+    market = []
+    pool = [x for x in cr.get("coaches", []) if not x.get("club_id")]
+    if q:
+        pool = [
+            x for x in pool
+            if q in f"{x.get('first_name','')} {x.get('last_name','')} {x.get('nation','')} {x.get('style','')} {x.get('level','')}".lower()
+        ]
+    for c in sorted(pool, key=lambda x: -CH_LVL(x)):
+        role = "head" if not head else "assistant" if not asst else ""
+        ok, why = W.can_hire_coach(cr, cid, c)
+        fee = int(c.get("wage", 0)) * (8 if c.get("named") else 4)
+        hire = (
+            f"<form method='post' action='/coach/hire/{c['id']}/{role}'><button>Buy {role} £{fee:,}</button></form>"
+            if ok and role else f"<p class='muted'>{why if not ok else 'Release a coach first.'}</p>"
+        )
+        market.append(_coach_card(c, "Free agent", hire))
+        if len(market) >= (30 if q else 12):
+            break
+    fit = ""
+    if head:
+        from engine import coaches as CH
+        fit = f" · tactic fit {CH.style_fit(head, cr['user'].get('style','balanced')):+.1f} on {cr['user'].get('style')}"
+    return html_page("Coaches", f"""
+    <div class="coach-page">
+    <h1>Coaches</h1>
+    <p class="lede">You are the manager. Staff change XI strength by <b>{boost:+.1f}</b>{fit}. Match their best playstyle on Game plan.</p>
+    <div class="mgr-row">{now}{sec}</div>
+    <div class="row tight">{''.join(acts)}</div>
+    <h2>Free coaches</h2>
+    <form class="mkt-tools" method="get" action="/coaches">
+      <input name="q" value="{q}" placeholder="Name, nation, style, level">
+      <button>Search</button>
+    </form>
+    <div class="mgr-grid">{''.join(market) or '<p class="muted">None free.</p>'}</div>
+    </div>
+    """, cr)
+
+
+def CH_LVL(c: dict) -> int:
+    return {"E": 0, "D": 1, "C": 2, "B": 3, "A": 4, "A+": 5, "S": 6}.get(c.get("level", "C"), 2)
 
 
 def page_club(cr: dict) -> str:
@@ -1131,7 +1304,10 @@ def page_club(cr: dict) -> str:
     <h1>Club</h1>
     <div class="club-bar">
       <form method="post" action="/save"><input type="hidden" name="slot" value="career1"><button class="tile-btn" type="submit">Save</button></form>
-      <form method="post" action="/advance"><button class="tile-btn" type="submit">Advance day</button></form>
+      <form method="post" action="/advance"><button class="tile-btn" type="submit">+1 day</button></form>
+      <form method="post" action="/advance/2"><button class="tile-btn" type="submit">+2 days</button></form>
+      <form method="post" action="/advance/30"><button class="tile-btn" type="submit">+1 month</button></form>
+      <form method="post" action="/advance/90"><button class="tile-btn" type="submit">+3 months</button></form>
       <form method="post" action="/goto-match"><button class="tile-btn" type="submit">Skip to match</button></form>
       <a class="tile-btn" href="/lobby">Lobby</a>
       <form method="post" action="/exit"><button class="tile-btn ghost" type="submit">Exit</button></form>
@@ -1178,7 +1354,7 @@ def page_trophies(cr: dict) -> str:
     <h2>This season — every league</h2>
     <ul class="feed">{''.join(boards)}</ul>
     <div class="panel scroll"><ul class="feed">{items}</ul></div>
-    """, cr)
+    """, cr, body_class="cabinet")
 
 
 def page_cups(cr: dict) -> str:
@@ -1264,6 +1440,7 @@ def page_cups(cr: dict) -> str:
 
 def page_ucl(cr: dict) -> str:
     W.ensure_cups(cr)
+    W.repair_europe(cr)
     def board(title: str) -> str:
         fx = [f for f in cr["fixtures"] if f.get("cup") == title]
         if not fx:
@@ -1304,7 +1481,7 @@ def page_ucl(cr: dict) -> str:
         order_l = []
         for rnd in ("playoff", "r16_po", "r16", "qf", "sf", "final"):
             rows = []
-            for f in sorted((x for x in fx if x.get("ko_round") == rnd), key=lambda x: (x.get("tie", ""), x.get("leg", 1))):
+            for f in sorted((x for x in fx if x.get("ko_round") == rnd and x.get("home_id") != x.get("away_id")), key=lambda x: (x.get("tie", ""), x.get("leg", 1))):
                 sc = f"{f.get('home_goals',0)}–{f.get('away_goals',0)}" if f.get("played") else f["date"][5:]
                 rows.append(
                     f"<li>{W.badge(W.club(cr, f['home_id']), 16)} {W.club(cr, f['home_id'])['short']} "
@@ -1415,8 +1592,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if "javascript" in ctype or "css" in ctype or "manifest" in ctype:
+            self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def _redir(self, loc: str, extra: list | None = None):
         self.send_response(303)
@@ -1439,9 +1621,14 @@ class Handler(BaseHTTPRequestHandler):
             if fp.is_file():
                 if fp.suffix == ".css":
                     self._send(200, fp.read_text(encoding="utf-8"), "text/css")
-                elif fp.suffix in (".jpg", ".jpeg", ".png", ".webp", ".wav"):
+                elif fp.suffix in (".json", ".webmanifest"):
+                    self._send(200, fp.read_text(encoding="utf-8"), "application/manifest+json")
+                elif fp.suffix in (".jpg", ".jpeg", ".png", ".webp", ".wav", ".mp3", ".ogg"):
                     data = fp.read_bytes()
-                    mime = "audio/wav" if fp.suffix == ".wav" else ("image/png" if fp.suffix == ".png" else "image/jpeg")
+                    mime = {
+                        ".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg",
+                        ".png": "image/png", ".webp": "image/webp",
+                    }.get(fp.suffix, "image/jpeg")
                     self.send_response(200)
                     self.send_header("Content-Type", mime)
                     self.send_header("Content-Length", str(len(data)))
@@ -1465,7 +1652,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/new":
             self._send(200, page_new())
             return
-        cr = career_for(self)
+        try:
+            cr = career_for(self)
+        except Exception:
+            cr = None
         STATE["career"] = cr
         if path == "/join" and cr is not None:
             self._send(200, page_join())
@@ -1490,6 +1680,8 @@ class Handler(BaseHTTPRequestHandler):
             "/market": lambda: page_market(cr, u.query),
             "/news": lambda: page_news(cr),
             "/club": lambda: page_club(cr),
+            "/coaches": lambda: page_coaches(cr, u.query),
+            "/settings": lambda: page_settings(cr),
             "/trophies": lambda: page_trophies(cr),
             "/cups": lambda: page_cups(cr),
             "/ucl": lambda: page_ucl(cr),
@@ -1718,9 +1910,15 @@ class Handler(BaseHTTPRequestHandler):
             W.play_fixture(cr, fid)
             self._redir(f"/report/{fid}")
             return
-        if path == "/advance":
-            W.advance_day(cr)
-            self._redir("/club")
+        if path == "/advance" or path.startswith("/advance/"):
+            n = 1
+            if path.startswith("/advance/"):
+                try:
+                    n = int(path.rsplit("/", 1)[-1])
+                except ValueError:
+                    n = 1
+            W.advance_days(cr, n)
+            self._redir("/home")
             return
         if path == "/goto-match":
             W.advance_to_next_match(cr)
@@ -1739,6 +1937,17 @@ class Handler(BaseHTTPRequestHandler):
             raw = "".join(ch for ch in (form.get("fee") or "") if ch.isdigit())
             W.try_buy(cr, int(path.rsplit("/", 1)[-1]), yrs, int(raw) if raw else None)
             self._redir("/market")
+            return
+        if path.startswith("/coach/"):
+            parts = path.strip("/").split("/")
+            if len(parts) >= 3 and parts[1] == "hire":
+                role = parts[3] if len(parts) > 3 else "head"
+                W.hire_coach(cr, int(parts[2]), role)
+            elif len(parts) >= 3 and parts[1] == "release":
+                W.release_coach(cr, parts[2])
+            elif len(parts) >= 3 and parts[1] == "renew":
+                W.renew_coach(cr, parts[2])
+            self._redir("/coaches")
             return
         if path.startswith("/sell/"):
             W.try_sell(cr, int(path.rsplit("/", 1)[-1]))

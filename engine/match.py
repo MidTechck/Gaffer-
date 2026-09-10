@@ -42,6 +42,7 @@ STYLE_NEED = {
     "direct": {"att": 1.06, "def": 1.02, "mid": 0.98},
     "quick_counter": {"att": 1.08, "mid": 1.02, "def": 0.96},
     "long_ball": {"att": 1.07, "def": 1.03, "mid": 0.95},
+    "long_ball_counter": {"att": 1.09, "def": 1.06, "mid": 0.94},
     "park_bus": {"def": 1.10, "gk": 1.04, "att": 0.90, "mid": 0.96},
     "out_wide": {"att": 1.05, "mid": 1.02, "def": 0.98},
     "gegenpress": {"att": 1.06, "mid": 1.05, "def": 0.96},
@@ -223,12 +224,16 @@ def simulate_match(
     away_stance: str = "balanced",
     home_form: str = "4-3-3",
     away_form: str = "4-3-3",
+    home_boost: float = 0.0,
+    away_boost: float = 0.0,
+    knockout: bool = False,
+    lite: bool = False,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     hs = xi_strength(home_xi, home_style)
     aws = xi_strength(away_xi, away_style)
-    h = hs["total"] + (2.2 if home_adv else 0.0)
-    a = aws["total"]
+    h = hs["total"] + (2.2 if home_adv else 0.0) + float(home_boost or 0)
+    a = aws["total"] + float(away_boost or 0)
     diff = h - a
     # ~8 strength points ≈ a clear favourite who should usually win.
     hxg = 1.15 + max(-1.1, min(1.8, diff * 0.14))
@@ -255,6 +260,32 @@ def simulate_match(
         hxg *= 0.82
     hg = _sample_goals(hxg, rng)
     ag = _sample_goals(axg, rng)
+
+    if lite:
+        def _credit(xi, n):
+            pool = list(xi.values()) or []
+            for _ in range(n):
+                if not pool:
+                    break
+                p = rng.choice(pool)
+                st = p.setdefault("season_stats", {"apps": 0, "goals": 0, "assists": 0})
+                st["goals"] = st.get("goals", 0) + 1
+        _credit(home_xi, hg)
+        _credit(away_xi, ag)
+        ratings = {}
+        for xi, gf, ga in ((home_xi, hg, ag), (away_xi, ag, hg)):
+            base = 6.4 + (gf - ga) * 0.15
+            for p in xi.values():
+                ratings[p["id"]] = round(max(5.2, min(8.6, base + rng.uniform(-0.2, 0.25))), 1)
+        return {
+            "home_goals": hg, "away_goals": ag,
+            "ft_home": hg, "ft_away": ag,
+            "extra_time": False, "pens_home": None, "pens_away": None,
+            "winner_side": "home" if hg > ag else "away" if ag > hg else None,
+            "home_xg": round(max(0.2, hxg), 2), "away_xg": round(max(0.2, axg), 2),
+            "home_strength": hs, "away_strength": aws,
+            "events": [], "injuries": [], "cards": [], "ratings": ratings,
+        }
 
     events = []
     scorers_h, scorers_a = [], []
@@ -409,9 +440,80 @@ def simulate_match(
         events.append({"minute": m, "type": "card", "name": card["name"], "text": txt})
     events.sort(key=lambda e: e["minute"])
 
+    ft_h, ft_a = hg, ag
+    pens_h = pens_a = None
+    extra_used = False
+    winner_side = None
+    if knockout and hg == ag:
+        events.append({"minute": 90, "type": "info", "text": "90' Full time. Extra time."})
+        extra_used = True
+        eh = 1 if rng.random() < min(0.42, hxg * 0.18) else 0
+        ea = 1 if rng.random() < min(0.42, axg * 0.18) else 0
+        if eh and ea and rng.random() < 0.45:
+            ea = 0
+        minute_pool.extend([93, 97, 102, 108, 112, 118])
+        for _ in range(eh):
+            if add_goal(home_xi, "home"):
+                hg += 1
+        for _ in range(ea):
+            if add_goal(away_xi, "away"):
+                ag += 1
+        events.append({"minute": 120, "type": "info", "text": f"120' Extra time ends {hg}–{ag}."})
+        if hg == ag:
+            events.append({"minute": 121, "type": "info", "text": "Penalties."})
+            pens_h = pens_a = 0
+            order_h = list(home_xi.values())
+            order_a = list(away_xi.values())
+            rng.shuffle(order_h)
+            rng.shuffle(order_a)
+            taken = 0
+            while taken < 5 or pens_h == pens_a:
+                ph = order_h[taken % max(1, len(order_h))]
+                pa = order_a[taken % max(1, len(order_a))]
+                hs_ok = rng.random() < 0.74
+                as_ok = rng.random() < 0.74
+                if hs_ok:
+                    pens_h += 1
+                events.append({
+                    "minute": 121 + taken, "type": "pen",
+                    "text": f"PEN {ph['last_name']} {'scores' if hs_ok else 'misses'} ({pens_h}–{pens_a})",
+                })
+                if taken >= 4 and pens_h > pens_a + (4 - taken) and not as_ok:
+                    pass
+                if as_ok:
+                    pens_a += 1
+                events.append({
+                    "minute": 121 + taken, "type": "pen",
+                    "text": f"PEN {pa['last_name']} {'scores' if as_ok else 'misses'} ({pens_h}–{pens_a})",
+                })
+                taken += 1
+                if taken >= 20:
+                    if pens_h == pens_a:
+                        pens_h += 1
+                    break
+            winner_side = "home" if pens_h > pens_a else "away"
+            events.append({
+                "minute": 130, "type": "info",
+                "text": f"Penalties {pens_h}–{pens_a}.",
+            })
+        else:
+            winner_side = "home" if hg > ag else "away"
+    elif hg > ag:
+        winner_side = "home"
+    elif ag > hg:
+        winner_side = "away"
+
+    events.sort(key=lambda e: e["minute"])
+
     return {
         "home_goals": hg,
         "away_goals": ag,
+        "ft_home": ft_h,
+        "ft_away": ft_a,
+        "extra_time": extra_used,
+        "pens_home": pens_h,
+        "pens_away": pens_a,
+        "winner_side": winner_side,
         "home_xg": round(max(0.2, hxg), 2),
         "away_xg": round(max(0.2, axg), 2),
         "home_strength": hs,
@@ -421,6 +523,61 @@ def simulate_match(
         "cards": cards,
         "ratings": {**rate(home_xi, hg, ag), **rate(away_xi, ag, hg)},
     }
+
+
+def apply_decider(res: dict, home_xi: dict, away_xi: dict, seed: int | None = None) -> dict:
+    if res.get("home_goals") != res.get("away_goals"):
+        res["winner_side"] = "home" if res["home_goals"] > res["away_goals"] else "away"
+        return res
+    rng = random.Random((seed or 1) + 17)
+    events = list(res.get("events") or [])
+    hg, ag = res["home_goals"], res["away_goals"]
+    events.append({"minute": 90, "type": "info", "text": "90' Level. Extra time."})
+    names_h = [p.get("last_name", "Home") for p in home_xi.values()] or ["Home"]
+    names_a = [p.get("last_name", "Away") for p in away_xi.values()] or ["Away"]
+    if rng.random() < 0.38:
+        hg += 1
+        events.append({"minute": rng.choice([97, 103, 109]), "type": "goal", "text": f"{events[-1]['minute'] if False else 102}' {rng.choice(names_h)} scored in extra time"})
+        events[-1]["minute"] = 102
+        events[-1]["text"] = f"102' {rng.choice(names_h)} scored in extra time"
+    if rng.random() < 0.34:
+        ag += 1
+        events.append({"minute": 111, "type": "goal", "text": f"111' {rng.choice(names_a)} scored in extra time"})
+    res["extra_time"] = True
+    res["home_goals"], res["away_goals"] = hg, ag
+    if hg != ag:
+        res["winner_side"] = "home" if hg > ag else "away"
+        events.append({"minute": 120, "type": "info", "text": f"120' Extra time {hg}–{ag}."})
+        res["events"] = sorted(events, key=lambda e: e.get("minute", 0))
+        return res
+    events.append({"minute": 120, "type": "info", "text": "120' Still level. Penalties."})
+    ph = pa = 0
+    for i in range(5):
+        hs_ok = rng.random() < 0.75
+        as_ok = rng.random() < 0.75
+        if hs_ok:
+            ph += 1
+        events.append({"minute": 121 + i, "type": "pen", "text": f"PEN {names_h[i % len(names_h)]} {'scores' if hs_ok else 'misses'} ({ph}–{pa})"})
+        if as_ok:
+            pa += 1
+        events.append({"minute": 121 + i, "type": "pen", "text": f"PEN {names_a[i % len(names_a)]} {'scores' if as_ok else 'misses'} ({ph}–{pa})"})
+        if i >= 3 and abs(ph - pa) > (4 - i):
+            break
+    while ph == pa:
+        hs_ok = rng.random() < 0.72
+        as_ok = rng.random() < 0.72
+        if hs_ok:
+            ph += 1
+        if as_ok:
+            pa += 1
+        events.append({"minute": 128, "type": "pen", "text": f"PEN sudden death {ph}–{pa}"})
+        if ph != pa:
+            break
+    res["pens_home"], res["pens_away"] = ph, pa
+    res["winner_side"] = "home" if ph > pa else "away"
+    events.append({"minute": 130, "type": "info", "text": f"Penalties {ph}–{pa}."})
+    res["events"] = sorted(events, key=lambda e: e.get("minute", 0))
+    return res
 
 
 FORMATIONS = {
