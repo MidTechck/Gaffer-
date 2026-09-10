@@ -155,6 +155,8 @@ def html_page(title: str, body: str, cr: dict | None, body_class: str = "") -> s
           <a href="/trophies">Trophies</a>
           <a href="/cups">Cups</a>
           <a href="/ucl">UCL</a>
+          <a href="/europa">Europa</a>
+          <a href="/conference">Conference</a>
           <a href="/settings">Settings</a>
         </nav>
         """
@@ -1176,17 +1178,46 @@ def page_market(cr: dict, raw_q: str = "") -> str:
 
 
 def page_news(cr: dict) -> str:
-    import re
-    score = re.compile(r"\d+\s*[–-]\s*\d+")
-    items = "".join(
-        f"<li><span>{n['date'][5:]}</span> {n['text']}</li>"
-        for n in W.wire_news(cr, 40)
-        if not score.search(n.get("text", "") or "")
-    ) or "<li>No wire stories yet.</li>"
+    STATIONS = {
+        "breaking": ("BBC", "Sky Sports", "L'Équipe"),
+        "transfer": ("Sky Sports", "Fabrizio", "Goal"),
+        "update": ("ESPN", "BBC", "The Athletic"),
+        "award": ("L'Équipe", "FIFA", "UEFA"),
+    }
+    HEADS = {
+        "breaking": "Breaking news",
+        "transfer": "Transfer news",
+        "update": "News updates",
+        "award": "Award news",
+    }
+    buckets = {k: [] for k in HEADS}
+    for n in cr.get("news", [])[:80]:
+        k = n.get("kind") or "update"
+        if k not in buckets:
+            k = W.classify_wire(n.get("text", ""), k)
+        if k not in buckets:
+            continue
+        buckets[k].append(n)
+    blocks = []
+    for kind, title in HEADS.items():
+        stations = STATIONS[kind]
+        cards = []
+        for i, n in enumerate(buckets[kind][:8]):
+            st = stations[i % len(stations)]
+            cards.append(
+                f"<article class='desk-card {kind}'>"
+                f"<span class='stn'>{st}</span>"
+                f"<h3>{title.split()[0].upper()}</h3>"
+                f"<p>{n.get('text')}</p>"
+                f"<time>{n.get('date','')}</time></article>"
+            )
+        if not cards:
+            cards.append(f"<p class='muted'>No {title.lower()} yet.</p>")
+        blocks.append(f"<section class='desk-col'><h2>{title}</h2>{''.join(cards)}</section>")
     return html_page("News", f"""
-    <h1>News</h1>
-    <p class="plan-sub">Wire — moves, rumours, injuries. Club mail stays on Home.</p>
-    <div class="panel scroll"><ul class="feed">{items}</ul></div>
+    <h1>News desk</h1>
+    <p class="plan-sub">Stations pull from this world. Club mail stays on Home.</p>
+    <div class="desk-grid">{''.join(blocks)}</div>
     """, cr)
 
 
@@ -1331,33 +1362,27 @@ def page_club(cr: dict) -> str:
 
 
 def page_trophies(cr: dict) -> str:
-    items = "".join(
-        f"<li>{t.get('season','')} — {t.get('title')}</li>"
-        for t in cr["user"].get("trophies", [])
-    ) or "<li>Empty cabinet. Win the league or an award.</li>"
-    mood = int(cr["user"].get("fan_mood", 60))
-    boards = []
-    for lg in cr["leagues"]:
-        aw = W.league_awards(cr, lg["id"])
-        if not aw:
-            continue
-        boot = aw.get("golden_boot")
-        play = aw.get("playmaker")
-        young = aw.get("young")
-        boards.append(
-            f"<li><b>{lg['name']}</b> — boot {boot['last_name'] if boot else '—'} "
-            f"({int((boot or {}).get('season_stats',{}).get('goals',0))}), "
-            f"assists {play['last_name'] if play else '—'}, "
-            f"young {young['last_name'] if young else '—'}</li>"
+    rows = cr["user"].get("trophies") or []
+    cols = (
+        ("league", "League title"),
+        ("domestic", "Domestic cups"),
+        ("ucl", "UCL"),
+        ("europa", "Europa"),
+        ("conference", "Conference"),
+    )
+    cells = []
+    for kind, label in cols:
+        won = [t for t in rows if t.get("kind") == kind]
+        years = "".join(
+            f"<li>{t.get('season','—')} · {t.get('date','')}</li>" for t in won
+        ) or "<li class='zero'>0</li>"
+        cells.append(
+            f"<article class='honour'><h3>{label}</h3><p class='count'>{len(won)}</p><ul>{years}</ul></article>"
         )
-    note = W.club(cr, cr["user"]["club_id"]).get("ai_note", "")
     return html_page("Trophies", f"""
     <h1>Trophy room</h1>
-    <p>Fans {mood}/100 · rank {W.team_rank(cr, cr['user']['club_id'])} · <a href="/news">Open the wire</a></p>
-    <p class="muted">{note}</p>
-    <h2>This season — every league</h2>
-    <ul class="feed">{''.join(boards)}</ul>
-    <div class="panel scroll"><ul class="feed">{items}</ul></div>
+    <p class="plan-sub">{W.club_name(cr, cr['user']['club_id'])} only · starts at 0</p>
+    <div class="honour-grid">{''.join(cells)}</div>
     """, cr, body_class="cabinet")
 
 
@@ -1443,6 +1468,18 @@ def page_cups(cr: dict) -> str:
 
 
 def page_ucl(cr: dict) -> str:
+    return page_europe(cr, "UCL")
+
+
+def page_europa(cr: dict) -> str:
+    return page_europe(cr, "Europa League")
+
+
+def page_conference(cr: dict) -> str:
+    return page_europe(cr, "Conference League")
+
+
+def page_europe(cr: dict, title: str) -> str:
     W.ensure_cups(cr)
     W.repair_europe(cr)
     def board(title: str) -> str:
@@ -1451,9 +1488,11 @@ def page_ucl(cr: dict) -> str:
             return f"<p class='muted'>No {title} draw in this career yet. Open Cups once, or start a new season.</p>"
         pts: dict[int, list] = {}
         for f in fx:
+            if f.get("phase") != "league":
+                continue
             pts.setdefault(f["home_id"], [0, 0, 0, 0])
             pts.setdefault(f["away_id"], [0, 0, 0, 0])
-            if f.get("phase") not in ("league", "group") or not f.get("played"):
+            if not f.get("played"):
                 continue
             hg, ag = f.get("home_goals", 0), f.get("away_goals", 0)
             pts[f["home_id"]][3] += 1
@@ -1493,8 +1532,8 @@ def page_ucl(cr: dict) -> str:
                     f" · L{f.get('leg',1)} · {sc}</li>"
                 )
             if rows:
-                lab = {"playoff": "Aug playoff", "r16_po": "KO playoff", "r16": "Round of 16",
-                       "qf": "Quarter-finals", "sf": "Semi-finals", "final": "Final"}[rnd]
+                lab = {"playoff": "Playoff", "r16_po": "KO playoff", "r16": "Round of 16",
+                       "qf": "Quarter-finals", "sf": "Semi-finals", "final": "Final", "third": "Third place"}[rnd]
                 order_l.append(f"<h4>{lab}</h4><ul class='feed tight'>{''.join(rows)}</ul>")
         bracket = "".join(order_l) or "<p class='muted'>Knockout after the league phase.</p>"
         return (
@@ -1507,17 +1546,23 @@ def page_ucl(cr: dict) -> str:
             f"</div>"
         )
     note = (
-        "<p class='lede'>Season 1 is domestic only. Finish the league — top 5 UCL, 6th Europa, 7th–8th Conference next year. One ticket each.</p>"
+        "<p class='lede'>Season 1 is domestic only. Next year: top 5 each European league to UCL (28 strongest), 6th Europa, 7th–8th Conference.</p>"
         if not cr["meta"].get("europe_on")
-        else "<p class='lede'>League phase, then knockout. Out of Europe means out. Cup winners can take a Europa seat next season if they are not already in UCL.</p>"
+        else "<p class='lede'>League phase (28) → groups of 4 → R16 → QF → SF → final + third place. Dates shift each season.</p>"
     )
-    return html_page("UCL", f"""
-    <h1>Europe & Africa</h1>
+    groups = (cr.get("meta") or {}).get("groups", {}).get(title) or {}
+    ghtml = ""
+    if groups:
+        bits = []
+        for letter, ids in groups.items():
+            rows = "".join(f"<li>{W.badge(W.club(cr, cid), 16)} {W.club(cr, cid)['name']}</li>" for cid in ids)
+            bits.append(f"<article class='honour'><h3>Group {letter}</h3><ul>{rows}</ul></article>")
+        ghtml = f"<div class='honour-grid'>{''.join(bits)}</div>"
+    return html_page(title, f"""
+    <h1>{title}</h1>
     {note}
-    {board("UCL")}
-    {board("Europa League")}
-    {board("Conference League")}
-    {board("CAF Champions League")}
+    {ghtml}
+    {board(title)}
     """, cr)
 
 
@@ -1700,6 +1745,8 @@ class Handler(BaseHTTPRequestHandler):
             "/trophies": lambda: page_trophies(cr),
             "/cups": lambda: page_cups(cr),
             "/ucl": lambda: page_ucl(cr),
+            "/europa": lambda: page_europa(cr),
+            "/conference": lambda: page_conference(cr),
             "/join": lambda: page_lobby(),
             "/lobby": lambda: page_lobby(),
         }
@@ -1732,7 +1779,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login":
             tok = A.login(form.get("user") or "", form.get("pw") or "")
             if not tok:
-                self._send(200, page_login("Use 3 or more letters."))
+                self._send(200, page_login("No account with that name. Create one first."))
                 return
             name = (form.get("user") or "").strip().lower()
             fp = ROOT / "saves" / f"user_{name}.json"

@@ -35,13 +35,27 @@ def _hash(pw: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 80_000).hex()
 
 
+def suggestions(name: str, db: dict | None = None) -> list[str]:
+    db = db or load()
+    taken = db.get("users", {})
+    out = []
+    for i in range(1, 30):
+        for cand in (f"{name}{i}", f"{name}_{i}"):
+            if cand not in taken and cand not in out:
+                out.append(cand)
+            if len(out) >= 3:
+                return out
+    return out
+
+
 def register(name: str, password: str = "") -> str | None:
     name = name.strip().lower()
     if len(name) < 3:
         return "Name 3+ letters."
     db = load()
     if name in db["users"]:
-        return None
+        ideas = ", ".join(suggestions(name, db))
+        return f"{name} is taken. Try {ideas}."
     db["users"][name] = {"name": name}
     db["friends"].setdefault(name, [])
     save(db)
@@ -53,7 +67,8 @@ def login(name: str, password: str = "") -> str | None:
     if len(name) < 3:
         return None
     db = load()
-    db["users"].setdefault(name, {"name": name})
+    if name not in db["users"]:
+        return None
     db["friends"].setdefault(name, [])
     tok = secrets.token_hex(16)
     db["tokens"][tok] = name
