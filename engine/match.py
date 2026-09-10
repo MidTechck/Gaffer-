@@ -134,15 +134,48 @@ def shape_mod(style: str, opp_form: str) -> float:
     return 0.0
 
 
+NEAR_ROLES = {
+    "ST": {"LW", "RW", "CAM"},
+    "LW": {"ST", "LM", "CAM", "RW"},
+    "RW": {"ST", "RM", "CAM", "LW"},
+    "CAM": {"CM", "ST", "LW", "RW"},
+    "CM": {"CDM", "CAM", "LM", "RM"},
+    "CDM": {"CM", "CB"},
+    "LM": {"LW", "CM", "LB"},
+    "RM": {"RW", "CM", "RB"},
+    "LB": {"LM", "CB", "LWB"},
+    "RB": {"RM", "CB", "RWB"},
+    "CB": {"CDM", "LB", "RB"},
+}
+
+
+def primary_role(player: dict) -> str:
+    roles = player.get("roles") or []
+    if roles:
+        return roles[0].get("code") or "CM"
+    return player.get("pos") or "CM"
+
+
+def pos_fit(player: dict, slot: str) -> tuple[str, float, float]:
+    """Return (dot, shown_overall, strength_mult). Card rarity uses true overall."""
+    slot = _slot_role(slot or "")
+    ovr = float(player.get("overall", 70))
+    primary = primary_role(player)
+    codes = {r.get("code") for r in player.get("roles") or [] if r.get("code")}
+    codes.add(primary)
+    if slot == "GK" or primary == "GK":
+        if slot == "GK" and primary == "GK":
+            return "green", ovr, 1.0
+        return "red", max(40.0, ovr * 0.58), 0.58
+    if slot in codes:
+        return "green", ovr, 1.0
+    if slot in NEAR_ROLES.get(primary, set()) or ROLE_LINE.get(slot) == ROLE_LINE.get(primary):
+        return "amber", round(ovr * 0.955, 1), 0.955
+    return "red", round(max(40.0, ovr * 0.72), 1), 0.72
+
+
 def _role_mult(player: dict, slot: str) -> float:
-    natural = {r["code"]: float(r.get("mult", 1)) for r in player.get("roles", [])}
-    if slot in natural:
-        return max(0.72, natural[slot])
-    line = ROLE_LINE.get(slot, "mid")
-    for code, m in natural.items():
-        if ROLE_LINE.get(code) == line:
-            return max(0.78, m * 0.9)
-    return 0.72
+    return pos_fit(player, slot)[2]
 
 
 def _slot_role(slot: str) -> str:

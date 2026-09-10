@@ -185,9 +185,9 @@
       if (kind === "start") setWord("LOADING");
       else playSteps(kind, wait);
       runBar(wait);
-      const body = new FormData(form);
+      const body = new URLSearchParams(new FormData(form));
       const begun = Date.now();
-      fetch(form.getAttribute("action"), { method: "POST", body: body, redirect: "follow", credentials: "same-origin" })
+      fetch(form.getAttribute("action"), { method: "POST", headers: {"Content-Type":"application/x-www-form-urlencoded"}, body: body.toString(), redirect: "follow", credentials: "same-origin" })
         .then(function (res) {
           const left = Math.max(0, wait - (Date.now() - begun));
           return new Promise(function (ok) { setTimeout(function () { ok(res); }, left); });

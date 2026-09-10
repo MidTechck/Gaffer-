@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 from engine import world as W
 from engine import accounts as A
 from engine.sponsors import CATALOG
-from engine.match import FORMATIONS, auto_xi, xi_strength
+from engine.match import FORMATIONS, auto_xi, xi_strength, pos_fit
 
 
 def mark(cr: dict, cid: int, size: int = 28) -> str:
@@ -90,7 +90,8 @@ def career_for(handler) -> dict | None:
                     STATE["save_error"] = "Last career file was damaged. Start a new career or load another save."
         if key in worlds:
             return bind_seat(worlds[key], account, seat)
-    return bind_seat(STATE.get("career"), account, seat)
+        return None
+    return None
 
 
 def career() -> dict | None:
@@ -229,17 +230,14 @@ def page_menu(user: str | None = None) -> str:
     if not user:
         return page_login()
     saves = []
-    folder = ROOT / "saves"
-    if folder.is_dir():
-        for fp in sorted(folder.glob("*.json")):
-            if fp.stem in ("accounts",):
-                continue
-            saves.append(
-                f"<form method='post' action='/load' class='row tight'>"
-                f"<input type='hidden' name='slot' value='{fp.stem}'>"
-                f"<button>Load {fp.stem}</button></form>"
-            )
-    load = "".join(saves) or "<p class='muted'>No saved careers.</p>"
+    mine = ROOT / "saves" / f"user_{user}.json"
+    if mine.is_file():
+        saves.append(
+            "<form method='post' action='/load' class='row tight'>"
+            f"<input type='hidden' name='slot' value='user_{user}'>"
+            "<button>Load my career</button></form>"
+        )
+    load = "".join(saves) or "<p class='muted'>No saved career on this account.</p>"
     err = f"<p class='warn'>{STATE.get('save_error')}</p>" if STATE.get("save_error") else ""
     pals = "".join(f"<li>{f}</li>" for f in A.friends_of(user)) or "<li class='muted'>None yet.</li>"
     port = A.port()
@@ -657,7 +655,13 @@ def player_card(p: dict | None, role: str, href: str = "", small: bool = False, 
             f"<span class='pc-ovr'>—</span><span class='pc-pos'>{role}</span>"
             f"<span class='pc-name'>empty</span></div>"
         )
-    ovr = float(p.get("overall", 70))
+    true_ovr = float(p.get("overall", 70))
+    pitch_role = role if slot in ("", "bench") else slot
+    dot, shown, _m = ("green", true_ovr, 1.0)
+    if slot and slot != "bench":
+        dot, shown, _m = pos_fit(p, slot)
+    ovr = true_ovr
+    shown_n = int(round(shown if slot and slot != "bench" else true_ovr))
     fit = max(0, min(100, float(p.get("condition", 88))))
     bar = "red" if p.get("injury") or fit < 40 else "amber" if fit < 70 else "green"
     inj = " inj" if p.get("injury") else ""
@@ -676,15 +680,15 @@ def player_card(p: dict | None, role: str, href: str = "", small: bool = False, 
     a = int(st.get("assists", 0))
     if small:
         return (
-            f"<div class='{cls} bench-card {rarity(ovr)}{inj}'{extra}>"
-            f"<span class='pc-ovr'>{ovr:.0f}</span>"
+            f"<div class='{cls} bench-card {rarity(true_ovr)}{inj}'{extra}>"
+            f"<span class='pc-ovr'>{shown_n}<i class='fit-dot {dot}'></i></span>"
             f"<span class='pc-pos'>{role}</span>"
             f"<span class='pc-name'>{p['last_name']}</span>"
             f"<span class='pc-bar {bar}' style='--fit:{fit}%'></span></div>"
         )
     return (
-        f"<div class='{cls} {rarity(ovr)}{inj}'{extra}>"
-        f"<span class='pc-ovr'>{ovr:.0f}</span>"
+        f"<div class='{cls} {rarity(true_ovr)}{inj}'{extra}>"
+        f"<span class='pc-ovr'>{shown_n}<i class='fit-dot {dot}'></i></span>"
         f"<span class='pc-pos'>{role}</span>"
         f"<span class='pc-name'>{p['last_name']}</span>"
         f"<span class='pc-bar {bar}' style='--fit:{fit}%'></span></div>"
@@ -1609,8 +1613,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_form(self) -> dict:
         n = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(n).decode("utf-8") if n else ""
-        q = parse_qs(raw)
+        raw = self.rfile.read(n) if n else b""
+        ctype = self.headers.get("Content-Type", "")
+        text = raw.decode("utf-8", errors="replace")
+        if "multipart/form-data" in ctype:
+            import re
+            out = {}
+            for m in re.finditer(
+                r'name="([^"]+)"\r?\n(?:Content-Type:[^\n]*\r?\n)?\r?\n([^\r\n]*)',
+                text,
+            ):
+                out[m.group(1)] = m.group(2).strip()
+            return out
+        q = parse_qs(text)
         return {k: v[0] if v else "" for k, v in q.items()}
 
     def do_GET(self):
@@ -1777,7 +1792,14 @@ class Handler(BaseHTTPRequestHandler):
             self._redir("/lobby", [f"room={code}; Path=/"])
             return
         if path == "/start":
-            cid = int(form.get("club", "1"))
+            me = who(self)
+            if not me:
+                self._redir("/")
+                return
+            if not form.get("club"):
+                self._redir("/new")
+                return
+            cid = int(form.get("club"))
             name = f"{form.get('first') or 'Alex'} {form.get('last') or 'Reed'}"
             crn = W.new_career(pack(), cid, name, {
                 "first": form.get("first") or "Alex",
@@ -1785,24 +1807,22 @@ class Handler(BaseHTTPRequestHandler):
                 "age": form.get("age") or 38,
                 "nation": form.get("nation") or "England",
             })
-            me = who(self)
-            crn["user"]["account"] = me or crn["user"].get("manager_name")
+            crn["user"]["account"] = me
             set_career(crn, me)
             (ROOT / "saves").mkdir(exist_ok=True)
-            W.save_json(ROOT / "saves" / "career1.json", crn)
-            self.send_response(303)
-            self.send_header("Location", "/home")
-            self.send_header("Set-Cookie", f"seat={cid}; Path=/")
-            me = who(self)
-            if me:
-                W.save_json(ROOT / "saves" / f"user_{me}.json", crn)
-            self.end_headers()
+            W.save_json(ROOT / "saves" / f"user_{me}.json", crn)
+            self._redir("/home", [f"seat={cid}; Path=/"])
             return
         if path == "/load":
-            slot = form.get("slot") or "career1"
+            me = who(self)
+            slot = form.get("slot") or ""
+            if not me or slot != f"user_{me}":
+                self._redir("/")
+                return
             fp = ROOT / "saves" / f"{slot}.json"
             if fp.is_file():
-                set_career(W.load_json(fp))
+                w = W.load_json(fp)
+                set_career(w, me)
                 self._redir("/home")
             else:
                 self._redir("/")
