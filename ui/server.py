@@ -203,13 +203,13 @@ def page_login(msg: str = "") -> str:
     return html_page("Sign in", f"""
     <section class="panel start">
       <h1>M.L26</h1>
-      <p class="lede">Manager League 26. One account on this phone or on the hosted server.</p>
+      <p class="lede">Enter a name. A new name is created. The same name next time opens that career.</p>
       <p class="warn">{msg}</p>
       <form method="post" action="/login" class="stack">
-        <label>Username <input name="user" required minlength="3"></label>
+        <label>Username <input name="user" required minlength="3" autocomplete="username"></label>
         <button class="primary">Enter</button>
       </form>
-      <p>No password. Each name keeps its own career.</p>
+      <p>No password. If you want a brand-new name that is close to one already used, <a href="/register">create one</a> and we will suggest free names.</p>
     </section>
     """, None)
 
@@ -1777,9 +1777,13 @@ class Handler(BaseHTTPRequestHandler):
             self._redir("/", [f"tok={tok}; Path=/"])
             return
         if path == "/login":
-            tok = A.login(form.get("user") or "", form.get("pw") or "")
+            raw = (form.get("user") or "").strip()
+            if len(raw) < 3:
+                self._send(200, page_login("Name needs 3 or more letters."))
+                return
+            tok = A.login(raw)
             if not tok:
-                self._send(200, page_login("No account with that name. Create one first."))
+                self._send(200, page_login("Could not open that name. Try another."))
                 return
             name = (form.get("user") or "").strip().lower()
             fp = ROOT / "saves" / f"user_{name}.json"

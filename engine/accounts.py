@@ -68,7 +68,9 @@ def login(name: str, password: str = "") -> str | None:
         return None
     db = load()
     if name not in db["users"]:
-        return None
+        db["users"][name] = {"name": name}
+        db["friends"].setdefault(name, [])
+        save(db)
     db["friends"].setdefault(name, [])
     tok = secrets.token_hex(16)
     db["tokens"][tok] = name
